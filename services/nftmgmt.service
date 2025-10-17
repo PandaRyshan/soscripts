@@ -1,0 +1,12 @@
+[Unit]
+Description=nftmgmt oneshot – load saved nftables rules at boot
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash /usr/local/bin/nftmgmt.sh load
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
