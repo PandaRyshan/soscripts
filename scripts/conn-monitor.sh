@@ -56,6 +56,9 @@ MAIL_USERNAME=""
 MAIL_PASSWORD=""
 MAIL_TO=("")
 
+# 全局邮件就绪标志：配置完整时为 true，否则为 false
+MAIL_READY=false
+
 # ==================== 监控配置 ====================
 INTERVAL=5
 THRESHOLD=2000
@@ -81,25 +84,29 @@ mkdir -p "$LOG_DIR"
 
 # ==================== 依赖检测 ====================
 check_and_install_dependencies() {
-    local bins=("swaks" "conntrack")
-    local pkgs=("swaks" "conntrack")
+    # 仅在开启邮件发送时安装 swaks
+    local bins=("conntrack")
+    local pkgs=("conntrack")
+
+    if [[ "$MAIL_READY" == true ]]; then
+        bins+=("swaks")
+        pkgs+=("swaks")
+    fi
 
     for i in "${!bins[@]}"; do
         if ! command -v "${bins[$i]}" &>/dev/null; then
             echo "缺少依赖: ${bins[$i]}，正在尝试安装..."
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y ${pkgs[$i]} >/dev/null 2>&1
-            if [ $? -eq 0 ]; then
-                echo "${bins[$i]} 安装成功"
-            else
-                echo "安装 ${bins[$i]} 失败，请手动安装"
-                exit 1
-            fi
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y ${pkgs[$i]} >/dev/null 2>&1 || {
+                echo "安装 ${bins[$i]} 失败，请手动安装"; exit 1;
+            }
+            echo "${bins[$i]} 安装成功"
         fi
     done
 }
 
 # ==================== 配置检查 ====================
+# 评估邮件配置是否完整，不再强制退出，仅设置 MAIL_READY 并提示
 check_config_vars() {
     local required_vars=("MAIL_SERVER" "MAIL_PORT" "MAIL_USERNAME" "MAIL_PASSWORD")
     local missing_vars=()
@@ -108,14 +115,18 @@ check_config_vars() {
             missing_vars+=("$var")
         fi
     done
-    if [[ ${#missing_vars[@]} -gt 0 ]]; then
-        echo "错误: 缺少配置变量: ${missing_vars[*]}"
-        exit 1
-    fi
-
+    local recipients_ok=true
     if [[ ${#MAIL_TO[@]} -eq 0 ]]; then
-        echo "错误: 至少需要配置一个收件人邮箱"
-        exit 1
+        recipients_ok=false
+    elif [[ ${MAIL_TO[0]} == "" ]]; then
+        recipients_ok=false
+    fi
+    if [[ ${#missing_vars[@]} -eq 0 && "$recipients_ok" == true ]]; then
+        MAIL_READY=true
+        echo "邮件配置完整，启用邮件通知"
+    else
+        MAIL_READY=false
+        echo "提示: 邮件配置不完整，已禁用邮件通知。缺失项: ${missing_vars[*]}，收件人有效: ${recipients_ok}"
     fi
 }
 
@@ -126,6 +137,12 @@ send_alert_email() {
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     local subject="TCP连接数预警 - ${timestamp}"
     local body="警告: TCP连接数已达到 ${total}，超过阈值 ${THRESHOLD}\n时间: ${timestamp}\n主机: $(hostname)\n\n连接数排名前10的源IP:\n${top_connections}"
+
+    if [[ "$MAIL_READY" != true ]]; then
+        echo "提示: 邮件配置不完整，跳过邮件发送"
+        LAST_ALERT_TIME=$(date +%s)
+        return 0
+    fi
 
     for recipient in "${MAIL_TO[@]}"; do
         echo "发送预警邮件到: $recipient"
@@ -249,7 +266,7 @@ main() {
     # 运行时提示：如果使用的是公网 IP 进行过滤，明确告知用户
     if [[ "$LOCAL_IP_SOURCE" == "public" ]]; then
         echo -e "提示: 未设置 LOCAL_IP_OVERRIDE 或无效，使用当前公网 IPv4 过滤: ${BLUE}${LOCAL_IP}${NC}"
-        echo -e "如需使用内网/指定 IP，请在运行前设置环境变量: \`LOCAL_IP_OVERRIDE=192.168.x.y\`"
+        echo -e "如需使用内网/指定 IP，请在运行前设置环境变量: `LOCAL_IP_OVERRIDE=192.168.x.y`"
     else
         echo -e "已使用用户覆盖的本机 IP: ${BLUE}${LOCAL_IP}${NC}"
     fi
@@ -262,6 +279,9 @@ main() {
     echo -e "  ${BLUE}蓝色${NC}: 本机IP (${LOCAL_IP})"
     echo "日志保存到: $LOG_DIR"
     echo "收件人: ${MAIL_TO[*]}"
+    if [[ "$MAIL_READY" != true ]]; then
+        echo "提示: 邮件配置不完整或未启用，将不发送邮件"
+    fi
     echo ""
 
     LAST_ALERT_TIME=""
