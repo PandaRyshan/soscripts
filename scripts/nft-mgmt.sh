@@ -498,7 +498,12 @@ open_port() {
   case "$proto" in
     tcp) $SUDO_CMD nft add element inet filter allowed_tcp_ports { $port } && log "开放 TCP 端口: $port" ;;
     udp) $SUDO_CMD nft add element inet filter allowed_udp_ports { $port } && log "开放 UDP 端口: $port" ;;
-    *) err "协议必须为 tcp 或 udp" ;;
+    any)
+      $SUDO_CMD nft add element inet filter allowed_tcp_ports { $port } >/dev/null 2>&1 || true
+      $SUDO_CMD nft add element inet filter allowed_udp_ports { $port } >/dev/null 2>&1 || true
+      log "开放 TCP+UDP 端口: $port"
+      ;;
+    *) err "协议必须为 tcp/udp/any" ;;
   esac
 }
 
@@ -512,7 +517,12 @@ close_port() {
   case "$proto" in
     tcp) $SUDO_CMD nft delete element inet filter allowed_tcp_ports { $port } && log "关闭 TCP 端口: $port" || true ;;
     udp) $SUDO_CMD nft delete element inet filter allowed_udp_ports { $port } && log "关闭 UDP 端口: $port" || true ;;
-    *) err "协议必须为 tcp 或 udp" ;;
+    any)
+      $SUDO_CMD nft delete element inet filter allowed_tcp_ports { $port } >/dev/null 2>&1 || true
+      $SUDO_CMD nft delete element inet filter allowed_udp_ports { $port } >/dev/null 2>&1 || true
+      log "关闭 TCP+UDP 端口: $port"
+      ;;
+    *) err "协议必须为 tcp/udp/any" ;;
   esac
 }
 
@@ -538,20 +548,12 @@ add_port_forward() {
     $SUDO_CMD nft add element inet filter fwd_udp_map { $dip . $dport } >/dev/null 2>&1 || true
   fi
 
-  # 记录到注册表
+  # 记录到注册表（CSV 为真源，显示/删除基于 CSV）
   mkdir_p_rules_dir
   local r="${remark//,/ }"
   echo "$pub,$proto,$dip,$dport,${r}" | $SUDO_CMD tee -a "$FORWARD_REG" >/dev/null
 
   log "已添加端口转发: $proto $pub -> $dip:$dport${remark:+ ($remark)}"
-
-  # 添加完端口转发后，立即输出当前已添加的转发规则，便于校验
-  echo "当前端口转发："
-  if [[ -f "$FORWARD_REG" ]]; then
-    awk -F',' 'NF>=4{proto=$2; if(proto=="") proto="any"; remark=$5; gsub(/^[[:space:]]+/, "", remark); gsub(/[[:space:]]+$/, "", remark); printf("%s %s %s %s%s\n", $1, proto, $3, $4, (remark? " " remark: ""))}' "$FORWARD_REG"
-  else
-    echo "无"
-  fi
 }
 
 del_port_forward() {
@@ -593,65 +595,51 @@ del_port_forward() {
   log "已移除端口转发: $proto $pub -> $dip:$dport"
 }
 
-# 交互式删除端口转发：列出现有 DNAT 规则并按编号删除
+# 交互式删除端口转发（基于 CSV 作为真源）：列出现有 CSV 并按编号删除对应协议
 interactive_delete_port_forward() {
-  ensure_nat_table
-  local out; out=$($SUDO_CMD nft -a list chain ip nat PREROUTING 2>/dev/null || true)
-  mapfile -t rules < <(echo "$out" | awk '
-    /dnat to/ && /(tcp|udp) dport/ {
-      proto=""; pub=""; dip=""; dport=""; h="";
-      for (i=1; i<=NF; i++) {
-        if ($i=="tcp"||$i=="udp") proto=$i;
-        if ($i=="dport") pub=$(i+1);
-        if ($i=="to") { split($(i+1), a, ":"); dip=a[1]; dport=a[2]; }
-        if ($i=="handle") h=$(i+1);
-      }
-      if (proto && pub && dip && dport && h) { printf("%s %s %s %s %s\n", proto, pub, dip, dport, h); }
-    }')
-  if [[ ${#rules[@]} -eq 0 ]]; then
-    echo "当前无端口转发规则"; return 0
-  fi
-  echo "当前端口转发："
+  mkdir_p_rules_dir
+  if [[ ! -f "$FORWARD_REG" ]]; then echo "当前无端口转发规则"; return 0; fi
+  mapfile -t records < <(awk -F',' 'NF>=4{proto=$2; if(proto=="") proto="any"; remark=$5; gsub(/^[[:space:]]+/, "", remark); gsub(/[[:space:]]+$/, "", remark); printf("%s,%s,%s,%s,%s\n", $1, proto, $3, $4, remark)}' "$FORWARD_REG")
+  if [[ ${#records[@]} -eq 0 ]]; then echo "当前无端口转发规则"; return 0; fi
+  echo "当前端口转发（CSV）："
   local i=0
-  for line in "${rules[@]}"; do
+  for line in "${records[@]}"; do
     i=$((i+1))
-    local proto pub dip dp h
-    read -r proto pub dip dp h <<<"$line"
-    printf "%d) %s %s -> %s:%s (handle %s)\n" "$i" "$proto" "$pub" "$dip" "$dp" "$h"
+    local pub proto dip dp remark
+    IFS="," read -r pub proto dip dp remark <<<"$line"
+    printf "%d) %s %s -> %s:%s%s\n" "$i" "$proto" "$pub" "$dip" "$dp" "${remark:+ ($remark)}"
   done
   local idx
   read -rp "输入编号（0 返回）： " idx
   [[ -z "$idx" ]] && return 0
   if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "无效编号"; return 1; fi
   if [[ "$idx" -eq 0 ]]; then return 0; fi
-  if (( idx < 1 || idx > ${#rules[@]} )); then echo "编号超出范围"; return 1; fi
-  local selected="${rules[$((idx-1))]}"
-  local proto pub dip dp h
-  read -r proto pub dip dp h <<<"$selected"
-  $SUDO_CMD nft delete rule ip nat PREROUTING handle "$h" || true
-  if [[ "$proto" == "tcp" ]]; then
+  if (( idx < 1 || idx > ${#records[@]} )); then echo "编号超出范围"; return 1; fi
+  local selected="${records[$((idx-1))]}"
+  local pub proto dip dp remark
+  IFS="," read -r pub proto dip dp remark <<<"$selected"
+
+  # 删除 nft DNAT 规则（可能为 tcp/udp/any）
+  local out handles
+  out=$($SUDO_CMD nft -a list chain ip nat PREROUTING 2>/dev/null || true)
+  if [[ "$proto" == "tcp" || "$proto" == "any" ]]; then
+    handles=$(echo "$out" | awk -v p="$pub" -v ip="$dip" -v dp="$dp" '/tcp dport/ && $0 ~ ("dport " p) && $0 ~ ("dnat to " ip ":" dp) {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+    while read -r h; do [[ -n "$h" ]] && $SUDO_CMD nft delete rule ip nat PREROUTING handle "$h" || true; done <<< "$handles"
     $SUDO_CMD nft delete element inet filter fwd_tcp_map { $dip . $dp } >/dev/null 2>&1 || true
-  else
+  fi
+  if [[ "$proto" == "udp" || "$proto" == "any" ]]; then
+    handles=$(echo "$out" | awk -v p="$pub" -v ip="$dip" -v dp="$dp" '/udp dport/ && $0 ~ ("dport " p) && $0 ~ ("dnat to " ip ":" dp) {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+    while read -r h; do [[ -n "$h" ]] && $SUDO_CMD nft delete rule ip nat PREROUTING handle "$h" || true; done <<< "$handles"
     $SUDO_CMD nft delete element inet filter fwd_udp_map { $dip . $dp } >/dev/null 2>&1 || true
   fi
-  # 更新注册表：若记录为 any，根据剩余协议更新为另一协议，否则移除
-  if [[ -f "$FORWARD_REG" ]]; then
-    local tmp; tmp=$(mktemp)
-    local other; other="tcp"; [[ "$proto" == "tcp" ]] && other="udp"
-    local out2; out2=$($SUDO_CMD nft -a list chain ip nat PREROUTING 2>/dev/null || true)
-    local other_exists
-    other_exists=$(echo "$out2" | awk -v o="$other" -v p="$pub" -v ip="$dip" -v dp="$dp" '/dnat to/ && $0 ~ (o " dport") && $0 ~ ("dport " p) && $0 ~ ("dnat to " ip ":" dp) {print "YES"; exit} END{print ""}')
-    awk -F',' -v p="$pub" -v pr="$proto" -v ip="$dip" -v dp="$dp" -v o="$other" -v oe="$other_exists" 'BEGIN{OFS=","}
-      {
-        if ($1==p && $3==ip && $4==dp) {
-          if ($2==pr) { next }
-          if ($2=="any") { if (oe=="YES") { $2=o; print $0; next } else { next } }
-        }
-        print $0
-      }' "$FORWARD_REG" > "$tmp"
-    $SUDO_CMD mv "$tmp" "$FORWARD_REG"
-  fi
-  log "已移除端口转发: $proto $pub -> $dip:$dp (handle $h)"
+
+  # 更新 CSV：any 记录删除一次；tcp/udp 仅删除匹配协议行
+  local tmp; tmp=$(mktemp)
+  awk -F',' -v p="$pub" -v pr="$proto" -v ip="$dip" -v dp="$dp" 'BEGIN{OFS=","}
+    { if ($1==p && $3==ip && $4==dp && (pr=="any" || $2==pr)) next; print $0 }' "$FORWARD_REG" > "$tmp"
+  $SUDO_CMD mv "$tmp" "$FORWARD_REG"
+
+  log "已移除端口转发: $proto $pub -> $dip:$dp"
 }
 
 enable_masquerade() {
@@ -661,11 +649,62 @@ enable_masquerade() {
   log "已在接口 $iface 启用 masquerade"
 }
 
+# 将当前 nft PREROUTING 规则同步到 CSV（保留已有备注）
+sync_forward_registry() {
+  require_root_or_sudo
+  ensure_nat_table
+  mkdir_p_rules_dir
+  local out tmp tmp_in
+  out=$($SUDO_CMD nft -a list chain ip nat PREROUTING 2>/dev/null || true)
+  tmp=$(mktemp)
+  tmp_in=$(mktemp)
+  printf "%s\n" "$out" > "$tmp_in"
+  if [[ -f "$FORWARD_REG" ]]; then
+    $SUDO_CMD awk 'BEGIN{FS=","; OFS=","}
+      NR==FNR { if (NF>=4) { key=$1 "," $3 "," $4; r=$5; gsub(/^[[:space:]]+|[[:space:]]+$/, "", r); remark[key]=r } ; next }
+      { if ($0 ~ /dnat to/ && ($0 ~ /tcp dport/ || $0 ~ /udp dport/)) {
+          proto=""; pub=""; dip=""; dp="";
+          n=split($0, a, /[[:space:]]+/);
+          for (i=1;i<=n;i++) {
+            if (a[i]=="tcp") proto="tcp";
+            else if (a[i]=="udp") proto="udp";
+            else if (a[i]=="dport") pub=a[i+1];
+            else if (a[i]=="to") { split(a[i+1], b, ":"); dip=b[1]; dp=b[2]; }
+          }
+          if (proto!="" && pub!="" && dip!="" && dp!="") {
+            key=pub "," dip "," dp;
+            if (protos[key]=="") protos[key]=proto; else if (protos[key]!=proto) protos[key]="any";
+          }
+        } }
+      END { for (k in protos) { split(k, parts, ","); pub=parts[1]; dip=parts[2]; dp=parts[3]; p=protos[k]; r=remark[k]; print pub, p, dip, dp, r } }' "$FORWARD_REG" "$tmp_in" > "$tmp"
+  else
+    $SUDO_CMD awk 'BEGIN{OFS=","}
+      { if ($0 ~ /dnat to/ && ($0 ~ /tcp dport/ || $0 ~ /udp dport/)) {
+          proto=""; pub=""; dip=""; dp="";
+          n=split($0, a, /[[:space:]]+/);
+          for (i=1;i<=n;i++) {
+            if (a[i]=="tcp") proto="tcp";
+            else if (a[i]=="udp") proto="udp";
+            else if (a[i]=="dport") pub=a[i+1];
+            else if (a[i]=="to") { split(a[i+1], b, ":"); dip=b[1]; dp=b[2]; }
+          }
+          if (proto!="" && pub!="" && dip!="" && dp!="") {
+            key=pub "," dip "," dp;
+            if (protos[key]=="") protos[key]=proto; else if (protos[key]!=proto) protos[key]="any";
+          }
+        } }
+      END { for (k in protos) { split(k, parts, ","); pub=parts[1]; dip=parts[2]; dp=parts[3]; p=protos[k]; print pub, p, dip, dp } }' "$tmp_in" > "$tmp"
+  fi
+  $SUDO_CMD mv "$tmp" "$FORWARD_REG"
+  $SUDO_CMD rm -f "$tmp_in" >/dev/null 2>&1 || true
+}
+
 save_rules() { mkdir_p_rules_dir; $SUDO_CMD sh -c "nft list ruleset > '$RULES_FILE'"; log "已保存规则到 $RULES_FILE"; }
 load_rules() { if [[ -f "$RULES_FILE" ]]; then $SUDO_CMD nft -f "$RULES_FILE"; log "已加载规则: $RULES_FILE"; else err "未找到规则文件: $RULES_FILE"; fi }
 
 list_status() {
   require_root_or_sudo
+  sync_forward_registry || true
   # 策略链
   local input_chain
   input_chain=$($SUDO_CMD nft -a list chain inet filter input 2>/dev/null | awk '/jump (input_any|input_whitelist|input_cn)/{print $2}' | tail -n1)
@@ -725,7 +764,7 @@ list_status() {
   fi
   if [[ -z "$USET" ]]; then echo "无"; else printf "%s\n" "$USET" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d'; fi
 
-  # 端口转发：读取注册表
+  # 端口转发：读取注册表（CSV 为真源，格式化合并 any）
   printf "\n转发端口:\n"
   if [[ -f "$FORWARD_REG" ]]; then
     awk -F',' 'NF>=4{proto=$2; if(proto=="") proto="any"; remark=$5; gsub(/^[[:space:]]+/, "", remark); gsub(/[[:space:]]+$/, "", remark); printf("%s %s %s %s%s\n", $1, proto, $3, $4, (remark? " " remark: ""))}' "$FORWARD_REG"
@@ -957,10 +996,10 @@ interactive_menu() {
           0) return ;;
           1) ensure_dependencies; init_nftables; list_status; break ;;
           2) set_policy_chain any; list_status; break ;;
-          3) set_policy_chain whitelist; list_status; break ;;
-          4) ensure_cn_set; set_policy_chain cn; list_status; break ;;
-          5) toggle_block_icmp; list_status; break ;;
-          6) toggle_block_udp; list_status; break ;;
+          3) list_status; set_policy_chain whitelist; break ;;
+          4) list_status; ensure_cn_set; set_policy_chain cn; break ;;
+          5) list_status; toggle_block_icmp; break ;;
+          6) list_status; toggle_block_udp; break ;;
           *) echo "无效选择"; break ;;
         esac
       done
@@ -970,29 +1009,30 @@ interactive_menu() {
   interactive_rules_menu() {
     while true; do
       echo
+      list_status
       PS3="选择规则操作（输入编号，0 返回）："
       select opt in \
         "添加允许 IP/CIDR" \
         "移除允许 IP/CIDR" \
         "添加黑名单 IP/CIDR" \
         "移除黑名单 IP/CIDR" \
-        "开放端口 (tcp/udp)" \
-        "关闭端口 (tcp/udp)" \
+        "开放端口 (tcp/udp/any)" \
+        "关闭端口 (tcp/udp/any)" \
         "添加端口转发" \
         "移除端口转发" \
         "启用接口 masquerade"
       do
         case "$REPLY" in
           0) return ;;
-          1) read -rp "输入允许 IP 或 CIDR: " ip; add_allow_ip "$ip"; list_status; break ;;
-          2) read -rp "输入移除的 IP 或 CIDR: " ip; del_allow_ip "$ip"; list_status; break ;;
-          3) read -rp "输入黑名单 IP 或 CIDR: " ip; add_block_ip "$ip"; list_status; break ;;
-          4) read -rp "输入移除的黑名单 IP 或 CIDR: " ip; del_block_ip "$ip"; list_status; break ;;
-          5) read -rp "协议 (tcp/udp): " proto; read -rp "端口: " port; open_port "$proto" "$port"; list_status; break ;;
-          6) read -rp "协议 (tcp/udp): " proto; read -rp "端口: " port; close_port "$proto" "$port"; list_status; break ;;
-          7) read -rp "协议 (tcp/udp/any，回车默认 any): " proto; [[ -z "$proto" ]] && proto="any"; read -rp "入站端口: " pub; read -rp "目标 IP/域名: " host; read -rp "目标端口: " dport; read -rp "备注(可选): " remark; add_port_forward "$proto" "$pub" "$host" "$dport" "$remark"; list_status; break ;;
-          8) interactive_delete_port_forward; list_status; break ;;
-          9) read -rp "输出接口名（例如：eth0）: " iface; enable_masquerade "$iface"; list_status; break ;;
+          1) read -rp "输入允许 IP 或 CIDR: " ip; add_allow_ip "$ip"; break ;;
+          2) read -rp "输入移除的 IP 或 CIDR: " ip; del_allow_ip "$ip"; break ;;
+          3) read -rp "输入黑名单 IP 或 CIDR: " ip; add_block_ip "$ip"; break ;;
+          4) read -rp "输入移除的黑名单 IP 或 CIDR: " ip; del_block_ip "$ip"; break ;;
+          5) read -rp "协议 (tcp/udp/any，回车默认 any): " proto; [[ -z "$proto" ]] && proto="any"; read -rp "端口: " port; open_port "$proto" "$port"; break ;;
+          6) read -rp "协议 (tcp/udp/any，回车默认 any): " proto; [[ -z "$proto" ]] && proto="any"; read -rp "端口: " port; close_port "$proto" "$port"; break ;;
+          7) read -rp "协议 (tcp/udp/any，回车默认 any): " proto; [[ -z "$proto" ]] && proto="any"; read -rp "入站端口: " pub; read -rp "目标 IP/域名: " host; read -rp "目标端口: " dport; read -rp "备注(可选): " remark; add_port_forward "$proto" "$pub" "$host" "$dport" "$remark"; break ;;
+          8) interactive_delete_port_forward; break ;;
+          9) read -rp "输出接口名（例如：eth0）: " iface; enable_masquerade "$iface"; break ;;
           *) echo "无效选择"; break ;;
         esac
       done
@@ -1001,6 +1041,7 @@ interactive_menu() {
 
   while true; do
     echo
+    list_status
     PS3="选择操作（输入编号，0 退出）："
     select opt in \
       "防火墙策略（初始化与策略切换）" \
@@ -1036,10 +1077,10 @@ usage() {
     allow del <IP/CIDR>   移除允许来源
     block add <IP/CIDR>   添加黑名单来源
     block del <IP/CIDR>   移除黑名单来源
-    port open tcp|udp <PORT>  开放端口
-    port close tcp|udp <PORT> 关闭端口
-    fwd add tcp|udp|any <IN_PORT> <DST_HOST/IP> <DST_PORT> [REMARK] 添加端口转发
-    fwd del tcp|udp|any <IN_PORT> <DST_HOST/IP> <DST_PORT>          移除端口转发
+    port open tcp|udp|any <PORT>  开放端口（any 同时开放 TCP+UDP）
+    port close tcp|udp|any <PORT> 关闭端口（any 同时关闭 TCP+UDP）
+    fwd add tcp|udp|any <IN_PORT> <DST_HOST/IP> <DST_PORT> [REMARK] 添加端口转发（CSV 保存为真源）
+    fwd del tcp|udp|any <IN_PORT> <DST_HOST/IP> <DST_PORT>          移除端口转发（基于 CSV 列表）
     masq <IFACE>          在接口启用 masquerade
     save                  保存当前规则到 $RULES_FILE
     load                  从 $RULES_FILE 加载规则
@@ -1078,8 +1119,8 @@ main() {
     port)
       ensure_dependencies
       case "${1:-}" in
-        open) open_port "${2:?缺少协议}" "${3:?缺少端口}"; list_status ;;
-        close) close_port "${2:?缺少协议}" "${3:?缺少端口}"; list_status ;;
+        open) open_port "${2:-any}" "${3:?缺少端口}"; list_status ;;
+        close) close_port "${2:-any}" "${3:?缺少端口}"; list_status ;;
         *) err "port 子命令需为 open/close" ;;
       esac ;;
     fwd)
