@@ -178,7 +178,7 @@ init_nftables() {
     log "检测到 nftables 为空，创建默认表与链..."
     $SUDO_CMD nft -f - <<'EOF'
 add table inet filter
-add chain inet filter input { type filter hook input priority 0; policy drop; }
+add chain inet filter input { type filter hook input priority 0; policy accept; }
 add chain inet filter output { type filter hook output priority 0; policy accept; }
 add chain inet filter forward { type filter hook forward priority 0; policy drop; }
 
@@ -202,7 +202,8 @@ add chain inet filter input_cn { }
 add rule inet filter input ct state established,related accept
 add rule inet filter input iif lo accept
 add rule inet filter input ip saddr @block_ips drop
-add rule inet filter input jump input_any
+# 默认不干涉入站，不跳转策略子链
+# add rule inet filter input jump input_any
 
 # input_any：仅端口白名单
 add rule inet filter input_any tcp dport @allowed_tcp_ports accept
@@ -238,7 +239,7 @@ EOF
     # 如果已有规则集，但缺少我们需要的元素，则补齐
     $SUDO_CMD nft -f - <<'EOF'
 add table inet filter
-add chain inet filter input { type filter hook input priority 0; policy drop; }
+add chain inet filter input { type filter hook input priority 0; policy accept; }
 add chain inet filter output { type filter hook output priority 0; policy accept; }
 add chain inet filter forward { type filter hook forward priority 0; policy drop; }
 add set inet filter allow_ips { type ipv4_addr; flags interval; }
@@ -264,7 +265,8 @@ flush chain inet filter input
 add rule inet filter input ct state established,related accept
 add rule inet filter input iif lo accept
 add rule inet filter input ip saddr @block_ips drop
-add rule inet filter input jump input_any
+# 默认不干涉入站，不跳转策略子链
+# add rule inet filter input jump input_any
 EOF
     # 确保策略子链规则存在
     $SUDO_CMD nft -f - <<'EOF'
@@ -285,76 +287,121 @@ EOF
   local ssh_port; ssh_port=$(get_ssh_port)
   $SUDO_CMD nft add element inet filter allowed_tcp_ports { $ssh_port } >/dev/null 2>&1 || true
   log "已确保 SSH 入站端口开放: tcp/$ssh_port"
-  # 将 SSH 端口在主 input 链上无条件放行，优先于策略跳转
-  set_policy_chain any
+  # 仅确保 SSH 白名单端口存在；不再切换到任何策略链
+  # 默认策略为开放，入站不干涉
+  :
+  # 应用当前策略开关到主链（保证初始化后立即生效）
+  get_policy_flags || true
+  apply_policy_rules
 }
 
-set_policy_chain() {
-  # 参数：any|whitelist|cn
-  local mode="$1"
-  local jump_chain="input_any"
-  case "$mode" in
-    whitelist) jump_chain="input_whitelist" ;;
-    cn) jump_chain="input_cn" ;;
-    any) jump_chain="input_any" ;;
-    *) err "未知模式 $mode"; return 1 ;;
-  esac
-  # 确保基础表与集合存在（逐条检查，避免 add 失败导致整段中止）
+apply_policy_rules() {
+  # 依据 ENABLE_IPWL/ENABLE_PORTWL/ENABLE_CNWL 开关重建规则，主 input 保持开放
+  get_policy_flags
+  # 确保基础表/集合/子链存在
   $SUDO_CMD nft list table inet filter >/dev/null 2>&1 || $SUDO_CMD nft add table inet filter
   $SUDO_CMD nft list set inet filter allow_ips   >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter allow_ips   '{ type ipv4_addr; flags interval; }'
   $SUDO_CMD nft list set inet filter allow_ips6  >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter allow_ips6  '{ type ipv6_addr; flags interval; }'
   $SUDO_CMD nft list set inet filter block_ips   >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter block_ips   '{ type ipv4_addr; flags interval; }'
   $SUDO_CMD nft list set inet filter allowed_tcp_ports >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter allowed_tcp_ports '{ type inet_service; }'
   $SUDO_CMD nft list set inet filter allowed_udp_ports >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter allowed_udp_ports '{ type inet_service; }'
-  $SUDO_CMD nft list set inet filter cn_ips      >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter cn_ips      '{ type ipv4_addr; flags interval; }'
-  $SUDO_CMD nft list set inet filter cn_ipv6     >/dev/null 2>&1 || $SUDO_CMD nft add set inet filter cn_ipv6     '{ type ipv6_addr; flags interval; }'
-  # 若策略子链不存在则创建，避免后续 flush/add 失败
   $SUDO_CMD nft list chain inet filter input_any >/dev/null 2>&1 || $SUDO_CMD nft add chain inet filter input_any '{ }'
   $SUDO_CMD nft list chain inet filter input_whitelist >/dev/null 2>&1 || $SUDO_CMD nft add chain inet filter input_whitelist '{ }'
   $SUDO_CMD nft list chain inet filter input_cn >/dev/null 2>&1 || $SUDO_CMD nft add chain inet filter input_cn '{ }'
-  # CN 模式下确保 CN 集合已填充，避免空集合导致误丢弃
-  if [[ "$mode" == "cn" ]]; then
+
+  # CN 集合开关：开启则确保/填充，关闭则删除集合（ip/ipv6）
+  if [[ "$ENABLE_CNWL" -eq 1 ]]; then
     ensure_cn_set || true
+  else
+    $SUDO_CMD nft delete set inet filter cn_ips >/dev/null 2>&1 || true
+    $SUDO_CMD nft delete set inet filter cn_ipv6 >/dev/null 2>&1 || true
   fi
-  # 防止 IPv4 数据包通过 ip family 的 input 钩子（policy accept）绕过策略
-  $SUDO_CMD nft list chain ip filter input >/dev/null 2>&1 && $SUDO_CMD nft delete chain ip filter input || true
+
+  # 刷新主 input 基础规则（保持开放，不跳转子链）
   local ssh_port; ssh_port=$(get_ssh_port)
-  # 刷新并写入主 input 链的基础规则
   $SUDO_CMD nft -f - <<'EOF'
 flush chain inet filter input
 add rule inet filter input ct state established,related accept
 add rule inet filter input iif lo accept
 add rule inet filter input ip saddr @block_ips drop
 EOF
-  # 优先无条件放行 SSH 管理端口，避免锁死
+  # 优先放行 SSH 端口
   $SUDO_CMD nft add rule inet filter input tcp dport $ssh_port accept || true
-  # 严格模式：在主链丢弃本机目的的非白名单来源新入站连接（不影响既有会话与本机外联）
-  if [[ "$mode" == "whitelist" ]]; then
-  $SUDO_CMD nft add rule inet filter input fib daddr type local ct state new ip saddr != @allow_ips ip saddr != @cn_ips drop || true
-  $SUDO_CMD nft add rule inet filter input fib daddr type local ct state new ip6 saddr != @allow_ips6 ip6 saddr != @cn_ipv6 drop || true
-  elif [[ "$mode" == "cn" ]]; then
-    # 在 CN 模式下，允许 allow_ips/allow_ips6 作为例外来源（与 CN 集合并集）
-    $SUDO_CMD nft add rule inet filter input fib daddr type local ct state new ip saddr != @cn_ips ip saddr != @allow_ips drop || true
-    $SUDO_CMD nft add rule inet filter input fib daddr type local ct state new ip6 saddr != @cn_ipv6 ip6 saddr != @allow_ips6 drop || true
-  fi
-  # 在非 CN 模式下，保留 allow_ips/allow_ips6 + 端口白名单的例外允许
-  if [[ "$mode" != "cn" ]]; then
-    $SUDO_CMD nft -f - <<'EOF'
-add rule inet filter input ip saddr @allow_ips tcp dport @allowed_tcp_ports accept
-add rule inet filter input ip saddr @allow_ips udp dport @allowed_udp_ports accept
-add rule inet filter input ip6 saddr @allow_ips6 tcp dport @allowed_tcp_ports accept
-add rule inet filter input ip6 saddr @allow_ips6 udp dport @allowed_udp_ports accept
+
+  # 重建子链为占位（仍保留，但主链不跳转）
+  $SUDO_CMD nft -f - <<'EOF'
+flush chain inet filter input_any
+flush chain inet filter input_whitelist
+flush chain inet filter input_cn
+add rule inet filter input_any counter drop
+add rule inet filter input_whitelist counter drop
+add rule inet filter input_cn counter drop
 EOF
+
+  # TCP 端口策略
+  if [[ "$ENABLE_PORTWL" -eq 1 ]]; then
+    if [[ "$ENABLE_IPWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr @allow_ips tcp dport @allowed_tcp_ports accept || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr @allow_ips6 tcp dport @allowed_tcp_ports accept || true
+    fi
+    if [[ "$ENABLE_CNWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr @cn_ips tcp dport @allowed_tcp_ports accept || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr @cn_ipv6 tcp dport @allowed_tcp_ports accept || true
+    fi
+    if [[ "$ENABLE_IPWL" -eq 0 && "$ENABLE_CNWL" -eq 0 ]]; then
+      $SUDO_CMD nft add rule inet filter input tcp dport @allowed_tcp_ports accept || true
+    fi
+    $SUDO_CMD nft add rule inet filter input meta l4proto tcp drop || true
   fi
-  # 最终跳转到对应策略子链
-  $SUDO_CMD nft add rule inet filter input jump "$jump_chain"
-  # 在安全策略（cn/whitelist）下默认加入 22/222/80/443 白名单端口
-  if [[ "$mode" == "cn" || "$mode" == "whitelist" ]]; then
-    ensure_default_ports || true
+
+  # UDP 策略
+  if [[ "$BLOCK_UDP" -eq 1 ]]; then
+    if [[ "$ENABLE_IPWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr @allow_ips udp dport @allowed_udp_ports accept || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr @allow_ips6 udp dport @allowed_udp_ports accept || true
+    fi
+    if [[ "$ENABLE_CNWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr @cn_ips udp dport @allowed_udp_ports accept || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr @cn_ipv6 udp dport @allowed_udp_ports accept || true
+    fi
+    if [[ "$ENABLE_IPWL" -eq 0 && "$ENABLE_CNWL" -eq 0 ]]; then
+      $SUDO_CMD nft add rule inet filter input udp dport @allowed_udp_ports accept || true
+    fi
+    $SUDO_CMD nft add rule inet filter input meta l4proto udp drop || true
   fi
-  # 根据策略开关（阻止ICMP/UDP）重建子链规则
-  rebuild_policy_chains
-  log "已切换入站策略为: $mode"
+
+  # ICMP 策略
+  if [[ "$BLOCK_ICMP" -eq 1 ]]; then
+    $SUDO_CMD nft add rule inet filter input meta l4proto { icmp, icmpv6 } drop || true
+  else
+    if [[ "$ENABLE_IPWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr @allow_ips meta l4proto icmp accept || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr @allow_ips6 meta l4proto icmpv6 accept || true
+    fi
+    if [[ "$ENABLE_CNWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr @cn_ips meta l4proto icmp accept || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr @cn_ipv6 meta l4proto icmpv6 accept || true
+    fi
+    if [[ "$ENABLE_IPWL" -eq 0 && "$ENABLE_CNWL" -eq 0 ]]; then
+      $SUDO_CMD nft add rule inet filter input meta l4proto { icmp, icmpv6 } accept || true
+    fi
+  fi
+
+  # 来源白名单最终丢弃（并集）
+  if [[ "$ENABLE_IPWL" -eq 1 || "$ENABLE_CNWL" -eq 1 ]]; then
+    if [[ "$ENABLE_IPWL" -eq 1 && "$ENABLE_CNWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr != @allow_ips ip saddr != @cn_ips drop || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr != @allow_ips6 ip6 saddr != @cn_ipv6 drop || true
+    elif [[ "$ENABLE_IPWL" -eq 1 ]]; then
+      $SUDO_CMD nft add rule inet filter input ip saddr != @allow_ips drop || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr != @allow_ips6 drop || true
+    else
+      $SUDO_CMD nft add rule inet filter input ip saddr != @cn_ips drop || true
+      $SUDO_CMD nft add rule inet filter input ip6 saddr != @cn_ipv6 drop || true
+    fi
+  fi
+
+  log "主链策略已应用 (IPWL=${ENABLE_IPWL}, PORTWL=${ENABLE_PORTWL}, CNWL=${ENABLE_CNWL}, UDP_BLOCK=${BLOCK_UDP}, ICMP_BLOCK=${BLOCK_ICMP})"
 }
 
 # 读取/保存策略开关（默认：不阻止 ICMP 与 UDP）
@@ -366,73 +413,24 @@ get_policy_flags() {
   fi
   BLOCK_ICMP=${BLOCK_ICMP:-0}
   BLOCK_UDP=${BLOCK_UDP:-0}
+  ENABLE_IPWL=${ENABLE_IPWL:-0}
+  ENABLE_PORTWL=${ENABLE_PORTWL:-0}
+  ENABLE_CNWL=${ENABLE_CNWL:-0}
 }
 save_policy_flags() {
   mkdir_p_rules_dir
   cat > "$POLICY_FLAGS_FILE" <<EOF
 BLOCK_ICMP=${BLOCK_ICMP}
 BLOCK_UDP=${BLOCK_UDP}
+ENABLE_IPWL=${ENABLE_IPWL}
+ENABLE_PORTWL=${ENABLE_PORTWL}
+ENABLE_CNWL=${ENABLE_CNWL}
 EOF
 }
 
-# 按当前开关重建三条策略子链规则
+# 按当前开关重建策略：统一改为应用到主 input 链
 rebuild_policy_chains() {
-  get_policy_flags
-  # 先清空三条子链
-  $SUDO_CMD nft -f - <<'EOF'
-flush chain inet filter input_any
-flush chain inet filter input_whitelist
-flush chain inet filter input_cn
-EOF
-  # input_any：TCP 按白名单；UDP 默认不阻止（开关可改）；ICMP 默认不阻止（开关可改）
-  $SUDO_CMD nft add rule inet filter input_any tcp dport @allowed_tcp_ports accept || true
-  if [[ "$BLOCK_UDP" -eq 1 ]]; then
-    $SUDO_CMD nft add rule inet filter input_any meta l4proto udp udp dport @allowed_udp_ports accept || true
-  else
-    $SUDO_CMD nft add rule inet filter input_any meta l4proto udp accept || true
-  fi
-  if [[ "$BLOCK_ICMP" -eq 0 ]]; then
-    $SUDO_CMD nft add rule inet filter input_any meta l4proto { icmp, icmpv6 } accept || true
-  fi
-  $SUDO_CMD nft add rule inet filter input_any counter drop || true
-
-  # input_whitelist：来源白名单 + TCP 端口白名单；UDP 默认不阻止；ICMP 默认不阻止
-  $SUDO_CMD nft add rule inet filter input_whitelist ip saddr @allow_ips tcp dport @allowed_tcp_ports accept || true
-  # 在白名单策略下，UDP 仅按端口白名单允许（不受阻止UDP开关影响）
-  $SUDO_CMD nft add rule inet filter input_whitelist ip saddr @allow_ips udp dport @allowed_udp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_whitelist ip6 saddr @allow_ips6 tcp dport @allowed_tcp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_whitelist ip6 saddr @allow_ips6 udp dport @allowed_udp_ports accept || true
-  # 同时允许预定义 CN 集合作为白名单来源（与 allow_ips 并集）
-  $SUDO_CMD nft add rule inet filter input_whitelist ip saddr @cn_ips tcp dport @allowed_tcp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_whitelist ip saddr @cn_ips udp dport @allowed_udp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_whitelist ip6 saddr @cn_ipv6 tcp dport @allowed_tcp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_whitelist ip6 saddr @cn_ipv6 udp dport @allowed_udp_ports accept || true
-  if [[ "$BLOCK_ICMP" -eq 0 ]]; then
-    $SUDO_CMD nft add rule inet filter input_whitelist ip saddr @allow_ips meta l4proto icmp accept || true
-    $SUDO_CMD nft add rule inet filter input_whitelist ip6 saddr @allow_ips6 meta l4proto icmpv6 accept || true
-    $SUDO_CMD nft add rule inet filter input_whitelist ip saddr @cn_ips meta l4proto icmp accept || true
-    $SUDO_CMD nft add rule inet filter input_whitelist ip6 saddr @cn_ipv6 meta l4proto icmpv6 accept || true
-  fi
-  $SUDO_CMD nft add rule inet filter input_whitelist counter drop || true
-
-  # input_cn：来源 CN + TCP 端口白名单；UDP 默认不阻止；ICMP 默认不阻止
-  $SUDO_CMD nft add rule inet filter input_cn ip saddr @cn_ips tcp dport @allowed_tcp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_cn ip6 saddr @cn_ipv6 tcp dport @allowed_tcp_ports accept || true
-  # 在 CN 策略下，UDP 仅按端口白名单允许（不受阻止UDP开关影响）
-  $SUDO_CMD nft add rule inet filter input_cn ip saddr @cn_ips udp dport @allowed_udp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_cn ip6 saddr @cn_ipv6 udp dport @allowed_udp_ports accept || true
-  # 同时允许 allow_ips/allow_ips6 作为 CN 模式的来源例外（与端口白名单配合）
-  $SUDO_CMD nft add rule inet filter input_cn ip saddr @allow_ips tcp dport @allowed_tcp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_cn ip6 saddr @allow_ips6 tcp dport @allowed_tcp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_cn ip saddr @allow_ips udp dport @allowed_udp_ports accept || true
-  $SUDO_CMD nft add rule inet filter input_cn ip6 saddr @allow_ips6 udp dport @allowed_udp_ports accept || true
-  if [[ "$BLOCK_ICMP" -eq 0 ]]; then
-    $SUDO_CMD nft add rule inet filter input_cn ip saddr @cn_ips meta l4proto icmp accept || true
-    $SUDO_CMD nft add rule inet filter input_cn ip6 saddr @cn_ipv6 meta l4proto icmpv6 accept || true
-    $SUDO_CMD nft add rule inet filter input_cn ip saddr @allow_ips meta l4proto icmp accept || true
-    $SUDO_CMD nft add rule inet filter input_cn ip6 saddr @allow_ips6 meta l4proto icmpv6 accept || true
-  fi
-  $SUDO_CMD nft add rule inet filter input_cn counter drop || true
+  apply_policy_rules
 }
 
 toggle_block_icmp() {
@@ -457,6 +455,96 @@ toggle_block_udp() {
   else
     log "已关闭阻止 UDP（默认放行 UDP）"
   fi
+}
+
+# 新增：独立策略开关与设置函数（IPWL/PORTWL/CNWL + UDP/ICMP 设置）
+
+toggle_ipwl() {
+  get_policy_flags
+  if [[ "$ENABLE_IPWL" -eq 0 ]]; then ENABLE_IPWL=1; else ENABLE_IPWL=0; fi
+  save_policy_flags
+  rebuild_policy_chains
+  if [[ "$ENABLE_IPWL" -eq 1 ]]; then
+    log "已开启 IP 白名单（来源需在 allow_ips/allow_ips6）"
+  else
+    log "已关闭 IP 白名单（来源不受限）"
+  fi
+}
+
+set_ipwl() {
+  local v="${1:-toggle}"
+  case "$v" in
+    on|1) get_policy_flags; ENABLE_IPWL=1; save_policy_flags; rebuild_policy_chains; log "IP 白名单: 开启" ;;
+    off|0) get_policy_flags; ENABLE_IPWL=0; save_policy_flags; rebuild_policy_chains; log "IP 白名单: 关闭" ;;
+    toggle) toggle_ipwl ;;
+    *) err "set_ipwl 参数需为 on/off/toggle" ;;
+  esac
+}
+
+toggle_portwl() {
+  get_policy_flags
+  if [[ "$ENABLE_PORTWL" -eq 0 ]]; then ENABLE_PORTWL=1; else ENABLE_PORTWL=0; fi
+  save_policy_flags
+  rebuild_policy_chains
+  if [[ "$ENABLE_PORTWL" -eq 1 ]]; then
+    log "已开启端口白名单（仅允许 allowed_tcp/allowed_udp）"
+  else
+    log "已关闭端口白名单（端口不受限，遵从协议阻止）"
+  fi
+}
+
+set_portwl() {
+  local v="${1:-toggle}"
+  case "$v" in
+    on|1) get_policy_flags; ENABLE_PORTWL=1; save_policy_flags; rebuild_policy_chains; log "端口白名单: 开启" ;;
+    off|0) get_policy_flags; ENABLE_PORTWL=0; save_policy_flags; rebuild_policy_chains; log "端口白名单: 关闭" ;;
+    toggle) toggle_portwl ;;
+    *) err "set_portwl 参数需为 on/off/toggle" ;;
+  esac
+}
+
+toggle_cnwl() {
+  get_policy_flags
+  if [[ "$ENABLE_CNWL" -eq 0 ]]; then ENABLE_CNWL=1; else ENABLE_CNWL=0; fi
+  save_policy_flags
+  # 开启时确保 CN 集合存在
+  if [[ "$ENABLE_CNWL" -eq 1 ]]; then ensure_cn_set || true; fi
+  rebuild_policy_chains
+  if [[ "$ENABLE_CNWL" -eq 1 ]]; then
+    log "已开启 CN 白名单（来源需在 cn_ips/cn_ipv6）"
+  else
+    log "已关闭 CN 白名单"
+  fi
+}
+
+set_cnwl() {
+  local v="${1:-toggle}"
+  case "$v" in
+    on|1) get_policy_flags; ENABLE_CNWL=1; save_policy_flags; ensure_cn_set || true; rebuild_policy_chains; log "CN 白名单: 开启" ;;
+    off|0) get_policy_flags; ENABLE_CNWL=0; save_policy_flags; rebuild_policy_chains; log "CN 白名单: 关闭" ;;
+    toggle) toggle_cnwl ;;
+    *) err "set_cnwl 参数需为 on/off/toggle" ;;
+  esac
+}
+
+set_block_icmp() {
+  local v="${1:-toggle}"
+  case "$v" in
+    on|1) get_policy_flags; BLOCK_ICMP=1; save_policy_flags; rebuild_policy_chains; log "阻止 ICMP: 开启" ;;
+    off|0) get_policy_flags; BLOCK_ICMP=0; save_policy_flags; rebuild_policy_chains; log "阻止 ICMP: 关闭" ;;
+    toggle) toggle_block_icmp ;;
+    *) err "set_block_icmp 参数需为 on/off/toggle" ;;
+  esac
+}
+
+set_block_udp() {
+  local v="${1:-toggle}"
+  case "$v" in
+    on|1) get_policy_flags; BLOCK_UDP=1; save_policy_flags; rebuild_policy_chains; log "阻止 UDP: 开启" ;;
+    off|0) get_policy_flags; BLOCK_UDP=0; save_policy_flags; rebuild_policy_chains; log "阻止 UDP: 关闭" ;;
+    toggle) toggle_block_udp ;;
+    *) err "set_block_udp 参数需为 on/off/toggle" ;;
+  esac
 }
 
 add_allow_ip() {
@@ -705,14 +793,13 @@ load_rules() { if [[ -f "$RULES_FILE" ]]; then $SUDO_CMD nft -f "$RULES_FILE"; l
 list_status() {
   require_root_or_sudo
   sync_forward_registry || true
-  # 策略链
-  local input_chain
-  input_chain=$($SUDO_CMD nft -a list chain inet filter input 2>/dev/null | awk '/jump (input_any|input_whitelist|input_cn)/{print $2}' | tail -n1)
-  printf "\n当前策略链: ${GREEN}%s${NC}\n" "${input_chain:-未知}"
 
   # 策略开关状态
   get_policy_flags || true
   printf "\n策略开关:\n"
+  if [[ "${ENABLE_IPWL:-0}" -eq 1 ]]; then echo "IP白名单: 开启"; else echo "IP白名单: 关闭"; fi
+  if [[ "${ENABLE_PORTWL:-0}" -eq 1 ]]; then echo "端口白名单: 开启"; else echo "端口白名单: 关闭"; fi
+  if [[ "${ENABLE_CNWL:-0}" -eq 1 ]]; then echo "CN白名单: 开启"; else echo "CN白名单: 关闭"; fi
   if [[ "${BLOCK_UDP:-0}" -eq 1 ]]; then echo "UDP阻止: 开启"; else echo "UDP阻止: 关闭"; fi
   if [[ "${BLOCK_ICMP:-0}" -eq 1 ]]; then echo "ICMP阻止: 开启"; else echo "ICMP阻止: 关闭"; fi
 
@@ -897,41 +984,36 @@ PY
   log "已尝试删除 conntrack 连接：$dir=$ip $proto:$port"
 }
 
-# 自动清理 conntrack：按来源 IP 是否在当前策略允许的地址段内判断
+# 自动清理 conntrack：基于策略开关 (IPWL/CNWL) 的允许来源并集
 conntrack_auto_clean() {
   require_root_or_sudo
   ensure_private_geoip || true
 
-  # 检测当前策略对应的来源集合（any 模式不按来源限制，跳过）
-  local jump_chain; jump_chain=$($SUDO_CMD nft -a list chain inet filter input | grep -E "jump (input_any|input_whitelist|input_cn)" | awk '{print $2}' | tail -n1)
-  local set_v4="" set_v6=""
-  case "${jump_chain:-input_any}" in
-    input_whitelist) set_v4="allow_ips"; set_v6="allow_ips6" ;;
-    input_cn) set_v4="cn_ips"; set_v6="cn_ipv6" ;;
-    *) log "当前策略为 any（不按来源限制），跳过自动清理"; return 0 ;;
-  esac
+  # 依据开关判断是否需要按来源清理
+  get_policy_flags || true
+  if [[ "${ENABLE_IPWL:-0}" -eq 0 && "${ENABLE_CNWL:-0}" -eq 0 ]]; then
+    log "当前策略未启用来源白名单（IPWL/CNWL 均关闭），跳过自动清理"
+    return 0
+  fi
 
-  # 导出允许来源集合到临时文件（CIDR 列表）
+  # 导出允许来源并集（IPWL/CNWL，根据开关取并集）
   local tmp4 tmp6 priv_tmp
   tmp4=$(mktemp) ; tmp6=$(mktemp) ; priv_tmp=$(mktemp)
-  $SUDO_CMD nft list set inet filter "$set_v4" 2>/dev/null | awk '/elements = \{/{flag=1; next} /\}/{if(flag){flag=0}} flag{gsub(/[,]/,"",$0); gsub(/^\s+|\s+$/,"",$0); if($0) print $0}' > "$tmp4" || true
-  $SUDO_CMD nft list set inet filter "$set_v6" 2>/dev/null | awk '/elements = \{/{flag=1; next} /\}/{if(flag){flag=0}} flag{gsub(/[,]/,"",$0); gsub(/^\s+|\s+$/,"",$0); if($0) print $0}' > "$tmp6" || true
   [[ -f "$PRIVATE_TXT_PATH" ]] && cp "$PRIVATE_TXT_PATH" "$priv_tmp" || :
 
-  # 将另一类来源加入白名单并集（确保当前策略下行为与脚本整体一致）
-  if [[ "$jump_chain" == "input_cn" ]]; then
+  if [[ "${ENABLE_IPWL:-0}" -eq 1 ]]; then
     $SUDO_CMD nft list set inet filter allow_ips 2>/dev/null | awk '/elements = \{/{flag=1; next} /\}/{if(flag){flag=0}} flag{gsub(/[,]/,"",$0); gsub(/^\s+|\s+$/,"",$0); if($0) print $0}' >> "$tmp4" || true
     $SUDO_CMD nft list set inet filter allow_ips6 2>/dev/null | awk '/elements = \{/{flag=1; next} /\}/{if(flag){flag=0}} flag{gsub(/[,]/,"",$0); gsub(/^\s+|\s+$/,"",$0); if($0) print $0}' >> "$tmp6" || true
-  elif [[ "$jump_chain" == "input_whitelist" ]]; then
+  fi
+  if [[ "${ENABLE_CNWL:-0}" -eq 1 ]]; then
     $SUDO_CMD nft list set inet filter cn_ips 2>/dev/null | awk '/elements = \{/{flag=1; next} /\}/{if(flag){flag=0}} flag{gsub(/[,]/,"",$0); gsub(/^\s+|\s+$/,"",$0); if($0) print $0}' >> "$tmp4" || true
     $SUDO_CMD nft list set inet filter cn_ipv6 2>/dev/null | awk '/elements = \{/{flag=1; next} /\}/{if(flag){flag=0}} flag{gsub(/[,]/,"",$0); gsub(/^\s+|\s+$/,"",$0); if($0) print $0}' >> "$tmp6" || true
   fi
 
-  # 收集唯一来源 IP
+  # 收集唯一来源 IP 并清理不在允许并集且不在私有/保留段的连接
   mapfile -t srcs < <($SUDO_CMD conntrack -L 2>/dev/null | sed -n 's/.*src=\([^ ]*\).*/\1/p' | sort -u)
   local killed=0 skipped=0 total=${#srcs[@]}
   for ip in "${srcs[@]}"; do
-    # Python 判断：在私有/保留或允许集合内则跳过，否则删除该来源的所有连接
     local ok
     ok=$(python3 - "$ip" "$tmp4" "$tmp6" "$priv_tmp" <<'PY'
 import sys, ipaddress
@@ -986,18 +1068,18 @@ interactive_menu() {
       PS3="选择策略操作（输入编号，0 返回）："
       select opt in \
         "初始化/修复 nftables" \
-        "切换策略：默认（端口白名单）" \
-        "切换策略：IP 白名单 + 端口白名单" \
-        "切换策略：仅允许 CN 来源 + 端口白名单" \
+        "开关：IP 白名单" \
+        "开关：端口白名单" \
+        "开关：CN 白名单" \
         "开关：阻止 ICMP" \
         "开关：阻止 UDP"
       do
         case "$REPLY" in
           0) return ;;
           1) ensure_dependencies; init_nftables; list_status; break ;;
-          2) set_policy_chain any; list_status; break ;;
-          3) list_status; set_policy_chain whitelist; break ;;
-          4) list_status; ensure_cn_set; set_policy_chain cn; break ;;
+          2) list_status; toggle_ipwl; break ;;
+          3) list_status; toggle_portwl; break ;;
+          4) list_status; toggle_cnwl; break ;;
           5) list_status; toggle_block_icmp; break ;;
           6) list_status; toggle_block_udp; break ;;
           *) echo "无效选择"; break ;;
@@ -1071,7 +1153,11 @@ usage() {
 
   命令：
     init                 初始化/修复 nftables，并自动开放 SSH 端口
-    mode any|whitelist|cn  切换入站策略（默认/白名单/CN来源）
+    policy ipwl on|off|toggle      控制 IP 白名单
+    policy portwl on|off|toggle    控制端口白名单
+    policy cnwl on|off|toggle      控制 CN 白名单
+    policy icmp-block on|off|toggle  控制阻止 ICMP
+    policy udp-block on|off|toggle   控制阻止 UDP
     cn update            下载/更新 CN IP 库并应用到集合
     allow add <IP/CIDR>   添加允许来源
     allow del <IP/CIDR>   移除允许来源
@@ -1088,6 +1174,7 @@ usage() {
     conntrack <src|dst> <IP> <tcp|udp> <PORT>  清理连接
     conntrack                 自动清理不在允许来源段内的连接（基于当前策略）
     menu                  进入交互式菜单
+    mode any|whitelist|cn  (兼容) 旧模式映射到新开关
 EOF
 }
 
@@ -1095,7 +1182,26 @@ main() {
   local cmd="${1:-menu}"; shift || true
   case "$cmd" in
     init) ensure_dependencies; init_nftables; list_status ;;
-    mode) ensure_dependencies; set_policy_chain "${1:-any}"; list_status ;;
+    mode)
+      ensure_dependencies
+      case "${1:-any}" in
+        any) set_portwl off; set_ipwl off; set_cnwl off ;;
+        whitelist) set_portwl on; set_ipwl on; set_cnwl off ;;
+        cn) set_portwl on; set_ipwl off; set_cnwl on ;;
+        *) err "mode 需为 any|whitelist|cn" ;;
+      esac
+      list_status ;;
+    policy)
+      ensure_dependencies
+      case "${1:-}" in
+        ipwl) set_ipwl "${2:-toggle}" ;;
+        portwl) set_portwl "${2:-toggle}" ;;
+        cnwl) set_cnwl "${2:-toggle}" ;;
+        icmp-block) set_block_icmp "${2:-toggle}" ;;
+        udp-block) set_block_udp "${2:-toggle}" ;;
+        *) err "policy 子命令需为 ipwl|portwl|cnwl|icmp-block|udp-block <on|off|toggle>" ;;
+      esac
+      list_status ;;
     cn)
       ensure_dependencies
       case "${1:-}" in
