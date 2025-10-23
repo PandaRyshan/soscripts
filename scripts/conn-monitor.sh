@@ -136,7 +136,7 @@ send_alert_email() {
     local top_connections=$2
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
     local subject="TCP连接数预警 - ${timestamp}"
-    local body="警告: TCP连接数已达到 ${total}，超过阈值 ${THRESHOLD}\n时间: ${timestamp}\n主机: $(hostname)\n\n连接数排名前10的源IP:\n${top_connections}"
+    local body="警告: TCP连接数已达到 ${total}，超过阈值 ${THRESHOLD}\n时间: ${timestamp}\n主机: $(hostname)\n\n源IP状态分布（Top5）：\n${top_connections}"
 
     if [[ "$MAIL_READY" != true ]]; then
         echo "提示: 邮件配置不完整，跳过邮件发送"
@@ -171,7 +171,8 @@ can_send_alert() {
 
 # ==================== 获取连接统计 ====================
 get_connection_stats() {
-    local connections=$(conntrack -L 2>/dev/null | grep "tcp.*dst=${LOCAL_IP}" | grep -v "CONNTRACK" || true)
+    local connections
+    connections=$(conntrack -L 2>/dev/null | grep -E "tcp" | grep -v "CONNTRACK" || true)
 
     if [ -z "$connections" ]; then
         echo "0"
@@ -179,24 +180,61 @@ get_connection_stats() {
         return
     fi
 
-    local total=$(echo "$connections" | wc -l)
-
-    local top_ips=$(echo "$connections" | awk '{
-        for(i=1;i<=NF;i++) {
-            if($i ~ /^src=/) {
-                ip = substr($i,5)
-                count[ip]++
-                break
+    # 生成每IP的各TCP状态计数，绑定到与 dst=LOCAL_IP 同一段的 src=
+    local result
+    result=$(echo "$connections" | awk -v lip="$LOCAL_IP" '
+    {
+        state=$4;
+        remote="";
+        for (i=1;i<=NF;i++) {
+            if ($i ~ /^src=/) {
+                remote=substr($i,5);
+            } else if ($i == "dst=" lip) {
+                if (remote!="") {
+                    key=remote SUBSEP state;
+                    sc[key]++;
+                    tot[remote]++;
+                }
+                break;
             }
         }
-    } END {
-        for(ip in count) {
-            printf "%s:%d\n", ip, count[ip]
+    }
+    END {
+        for (ip in tot) {
+            out="";
+            est_key=ip SUBSEP "ESTABLISHED";
+            if (sc[est_key] > 0) {
+                out = out " ESTABLISHED:" sc[est_key];
+            }
+            for (k in sc) {
+                split(k, parts, SUBSEP);
+                if (parts[1] == ip && parts[2] != "ESTABLISHED") {
+                    out = out " " parts[2] ":" sc[k];
+                }
+            }
+            printf "%d %s%s\n", tot[ip], ip, out;
         }
-    }' | sort -t: -k2 -nr | head -10)
+    }' | sort -nr -k1,1 | head -10 | awk '{ $1=""; sub(/^ /,"",$0); print }')
+
+    # 统计总数（绑定到同一段）
+    local total
+    total=$(echo "$connections" | awk -v lip="$LOCAL_IP" '
+    BEGIN { grand=0 }
+    {
+        remote="";
+        for (i=1;i<=NF;i++) {
+            if ($i ~ /^src=/) {
+                remote=substr($i,5);
+            } else if ($i == "dst=" lip) {
+                if (remote!="") grand++;
+                break;
+            }
+        }
+    }
+    END { print grand }')
 
     echo "$total"
-    echo "$top_ips"
+    echo "$result"
 }
 
 # ==================== 颜色选择函数 ====================
@@ -242,12 +280,20 @@ format_output() {
 
     if [ -n "$stats" ] && [ "$total" -gt 0 ]; then
         while IFS= read -r line; do
-            if [ -n "$line" ]; then
-                IFS=':' read -r ip count <<< "$line"
-                # 获取IP颜色
-                local ip_color=$(get_ip_color "$count" "$ip")
-                output+="${ip_color}${ip}：${count}${NC}\n"
-            fi
+            [ -z "$line" ] && continue
+            # 第一个字段是IP，后续是 "状态:数量"
+            local ip rest sum cnt tok ip_color
+            ip=$(printf "%s" "$line" | awk '{print $1}')
+            rest=$(printf "%s" "$line" | cut -d' ' -f2-)
+            sum=0
+            for tok in $rest; do
+                cnt="${tok#*:}"
+                if [[ "$cnt" =~ ^[0-9]+$ ]]; then
+                    sum=$((sum + cnt))
+                fi
+            done
+            ip_color=$(get_ip_color "$sum" "$ip")
+            output+="${ip_color}${ip}${NC} ${rest}\n"
         done <<< "$stats"
     else
         output+="暂无连接统计\n"
@@ -308,16 +354,13 @@ main() {
 
         if [ "$total" -gt "$THRESHOLD" ]; then
             if [ "$ALERT_ACTIVE" = false ]; then
-                echo "警告: TCP连接数超过阈值 ${THRESHOLD}！"
+                echo "警告: TCP连接数超过阈值 ${THRESHOLD}!"
                 ALERT_ACTIVE=true
             fi
 
             if can_send_alert; then
                 echo "尝试发送预警邮件..."
-                top_connections=$(echo "$connections" | head -5 | while IFS= read -r line; do
-                    IFS=':' read -r ip count <<< "$line"
-                    echo "${ip}: ${count} 连接"
-                done)
+                top_connections=$(echo "$connections" | head -5)
                 send_alert_email "$total" "$top_connections"
             fi
         else
