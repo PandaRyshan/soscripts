@@ -1,0 +1,30 @@
+[Unit]
+Description=TCP Connection Monitor Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/conn-monitor
+Restart=always
+RestartSec=10
+StartLimitInterval=0
+Environment="MAIL_SERVER=smtp.yourmail.com"
+Environment="MAIL_PORT=587"
+Environment="MAIL_USERNAME=your_username"
+Environment="MAIL_PASSWORD=your_password"
+Environment="MAIL_DEFAULT_SENDER=alert@yourdomain.com"
+
+# 日志配置
+SyslogIdentifier=conn-monitor
+ReadWritePaths=/var/log/conn-monitor
+
+# 安全配置
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

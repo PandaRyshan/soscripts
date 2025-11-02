@@ -14,8 +14,8 @@ LOW_THRESHOLD=1200    # 绿色 < 1200
 MID_THRESHOLD=1700    # 黄色 1200-1700，红色 > 1700
 
 # 单IP连接数颜色阈值
-IP_LOW_THRESHOLD=120  # 绿色 < 120
-IP_MID_THRESHOLD=170  # 黄色 120-170，红色 > 170
+IP_LOW_THRESHOLD=150  # 绿色 < 150
+IP_MID_THRESHOLD=200  # 黄色 150-200，红色 > 200
 
 # ==================== 辅助函数 ====================
 # 校验 IPv4 地址是否合法（格式和每段 0-255）
@@ -49,18 +49,18 @@ is_private_ipv4() {
 }
 
 # ==================== 邮件配置 ====================
-MAIL_SERVER="server.cloudcone.email"
-MAIL_PORT="587"
+MAIL_SERVER="${MAIL_SERVER:-}"
+MAIL_PORT="${MAIL_PORT:-}"
 MAIL_USE_TLS="true"
-MAIL_USERNAME=""
-MAIL_PASSWORD=""
-MAIL_TO=("")
+MAIL_USERNAME="${MAIL_USERNAME:-}"
+MAIL_PASSWORD="${MAIL_PASSWORD:-}"
+MAIL_TO=(${MAIL_TO:-})
 
 # 全局邮件就绪标志：配置完整时为 true，否则为 false
 MAIL_READY=false
 
 # ==================== 监控配置 ====================
-INTERVAL=5
+INTERVAL=10
 THRESHOLD=2000
 COOLDOWN_PERIOD=300
 # 允许用户自定义填写一个 IP（比如内网 IP），否则自动获取当前公网 IPv4

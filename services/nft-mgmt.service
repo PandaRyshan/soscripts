@@ -1,12 +1,13 @@
 [Unit]
 Description=nftmgmt oneshot – load saved nftables rules at boot
+Before=fail2ban.service
 After=network.target
 Wants=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/env bash /usr/local/bin/nftmgmt.sh load
 RemainAfterExit=yes
+ExecStart=/usr/local/bin/nft-mgmt --ensure-struct
 
 [Install]
 WantedBy=multi-user.target
