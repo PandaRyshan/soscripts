@@ -588,17 +588,9 @@ status() {
 save_rules() {
   require_root_or_sudo
   $SUDO_CMD mkdir -p "$CONF_DIR"
-  # 仅保存 inet filter 相关片段，避免覆盖系统其它 nftables 配置
-  local tmp
-  tmp=$(mktemp)
-  # 直接导出完整的 table 声明，避免截断导致语法错误
-  $SUDO_CMD nft list table inet filter > "$tmp" 2>/dev/null || {
-    # 如不存在，先建立结构再导出
-    ensure_struct
-    $SUDO_CMD nft list table inet filter > "$tmp"
-  }
-  $SUDO_CMD mv "$tmp" "$CONF_FILE"
-  log "已保存 inet filter 片段到 $CONF_FILE"
+  # 保存完整的 nftables ruleset，包含所有表（inet filter + ip nat + 端口转发）
+  $SUDO_CMD sh -c "nft list ruleset > '$CONF_FILE'"
+  log "已保存完整 nftables 规则到 $CONF_FILE"
 }
 
 load_rules() {
@@ -606,21 +598,11 @@ load_rules() {
   if [[ ! -f "$CONF_FILE" ]]; then
     err "未找到已保存的规则文件: $CONF_FILE"; exit 1
   fi
-  # 仅加载保存的 inet filter 表声明，避免包含其它表片段导致 EOF
-  # 如果文件中包含除了 inet filter 外的内容（例如 f2b-table 等），先过滤掉
-  local tmp
-  tmp=$(mktemp)
-  awk 'BEGIN{p=0} /^table inet filter/{p=1} p{print} /^}/ && p{exit}' "$CONF_FILE" > "$tmp"
-  if [[ ! -s "$tmp" ]]; then
-    err "保存文件中未找到 inet filter 表片段"; rm -f "$tmp"; exit 1
-  fi
-  # 预先删除旧表以避免声明冲突
-  $SUDO_CMD nft list table inet filter >/dev/null 2>&1 && $SUDO_CMD nft delete table inet filter >/dev/null 2>&1 || true
-  $SUDO_CMD nft -f "$tmp"
-  rm -f "$tmp"
+  # 加载完整的 nftables ruleset（包含所有表）
+  $SUDO_CMD nft -f "$CONF_FILE"
   # 确保白名单控制逻辑与集合状态同步
   sync_wl_ctrl || true
-  log "已加载规则片段自 $CONF_FILE"
+  log "已加载完整 nftables 规则自 $CONF_FILE"
 }
 
 usage() {
@@ -644,7 +626,7 @@ usage() {
   -pfa, --pf-add         添加端口转发规则
   -pfd, --pf-del         删除端口转发规则
   -pfc, --pf-clear       清空所有端口转发规则
-  -pfs, --pf-save        保存端口转发规则
+  # -pfs, --pf-save        保存端口转发规则（已弃用，使用统一的 save 命令）
   -pfm, --pf-masq        管理 masquerade 设置
 
 说明:
@@ -663,8 +645,7 @@ main_menu_forward() {
     echo "2) 添加端口转发规则"
     echo "3) 删除端口转发规则"
     echo "4) 清空所有端口转发规则"
-    echo "5) 保存端口转发规则"
-    echo "6) 管理 masquerade 设置"
+    echo "5) 管理 masquerade 设置"
     echo "0) 返回主菜单"
     echo
     read -rp "请选择操作 [0-6]: " choice || true
@@ -673,8 +654,7 @@ main_menu_forward() {
       2) add_forward_rule ;;
       3) delete_forward_rules ;;
       4) clear_forward_rules ;;
-      5) save_forward_rules ;;
-      6) masquerade_menu ;;
+      5) masquerade_menu ;;
       0) break ;;
       *) echo "无效选择，请重新输入" ;;
     esac
@@ -719,7 +699,7 @@ main() {
     -pfa|--pf-add) add_forward_rule ;;
     -pfd|--pf-del) delete_forward_rules ;;
     -pfc|--pf-clear) clear_forward_rules ;;
-    -pfs|--pf-save) save_forward_rules ;;
+    # -pfs|--pf-save) save_forward_rules ;;  # 已弃用，使用统一的 save 命令
     -pfm|--pf-masq) masquerade_menu ;;
     ""|-h|--help) usage ;;
     *) err "未知子命令: $cmd"; usage; exit 1 ;;

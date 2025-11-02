@@ -14,7 +14,6 @@ Environment="MAIL_SERVER=smtp.yourmail.com"
 Environment="MAIL_PORT=587"
 Environment="MAIL_USERNAME=your_username"
 Environment="MAIL_PASSWORD=your_password"
-Environment="MAIL_DEFAULT_SENDER=alert@yourdomain.com"
 
 # 日志配置
 SyslogIdentifier=conn-monitor
