@@ -1008,8 +1008,8 @@ usage() {
 
 端口转发（pf）与 masquerade（pfm）命令：
     pf                         进入端口转发管理菜单
-    pf add <proto> <pub> <dip/host> <dp> [remark]
-                               通过参数添加端口转发（proto: any|tcp|udp）
+    pf add [<proto> <pub> <dip/host> <dp> [remark]]
+                               通过参数添加端口转发（proto: any|tcp|udp）；不带参数进入交互添加菜单
     pf del <proto> <pub> <dip/host> <dp>
                                通过参数删除端口转发（精准删除，无需备注）
     pf clear                   清空所有端口转发规则
@@ -1111,7 +1111,14 @@ main() {
         update) do_update_self "$@" ;;
         pf)
             case "${1:-}" in
-                add) shift || true; pf_add_from_args "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+                add)
+                    shift || true
+                    if [ -z "${1:-}" ]; then
+                        add_forward_rule
+                    else
+                        pf_add_from_args "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+                    fi
+                    ;;
                 del)
                     shift || true
                     if [ -z "${1:-}" ]; then
