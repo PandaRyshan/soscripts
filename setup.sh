@@ -147,8 +147,25 @@ download_scripts() {
     $SUDO_CMD curl -fsSL "$src_url" -o "$dst_path"
     $SUDO_CMD chmod +x "$dst_path"
     local name_no_ext="${f%.sh}"
-    log "创建可执行链接: ${BIN_DIR}/${name_no_ext} -> ${dst_path}"
-    $SUDO_CMD ln -sf "$dst_path" "${BIN_DIR}/${name_no_ext}"
+    local link_path="${BIN_DIR}/${name_no_ext}"
+    # 若已存在普通文件，替换为软链；若为软链但指向旧目标，刷新指向
+    if $SUDO_CMD test -e "$link_path" && ! $SUDO_CMD test -L "$link_path"; then
+      log "检测到已存在的普通文件: ${link_path}，将替换为软链"
+      $SUDO_CMD rm -f "$link_path"
+    fi
+    if $SUDO_CMD test -L "$link_path"; then
+      local cur_target
+      cur_target=$($SUDO_CMD readlink -f "$link_path" || true)
+      if [[ "$cur_target" != "$dst_path" ]]; then
+        log "刷新软链: ${link_path} (旧: ${cur_target}) -> ${dst_path}"
+        $SUDO_CMD ln -sfn "$dst_path" "$link_path"
+      else
+        log "软链已指向最新脚本: ${link_path} -> ${dst_path}"
+      fi
+    else
+      log "创建可执行链接: ${link_path} -> ${dst_path}"
+      $SUDO_CMD ln -sfn "$dst_path" "$link_path"
+    fi
   done
 }
 
