@@ -19,6 +19,55 @@ log() { echo "[${SCRIPT_NAME}] $*"; }
 err() { echo "[${SCRIPT_NAME}][ERROR] $*" >&2; }
 warn() { echo "[${SCRIPT_NAME}][WARN] $*"; }
 
+# 远程更新源（raw 地址）
+UPDATE_SRC_URL="https://raw.githubusercontent.com/PandaRyshan/soscripts/refs/heads/main/scripts/nft-mgmt.sh"
+
+# 检查可用下载器
+pick_downloader() {
+    if command -v curl >/dev/null 2>&1; then echo "curl"; return 0; fi
+    if command -v wget >/dev/null 2>&1; then echo "wget"; return 0; fi
+    echo ""; return 1
+}
+
+# 执行自我更新（下载覆盖当前脚本文件），不重启服务
+do_update_self() {
+    local url="$UPDATE_SRC_URL"
+    local self_path
+    self_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    if [[ -z "$self_path" || ! -f "$self_path" ]]; then
+        err "无法定位当前脚本路径，更新中止"
+        return 1
+    fi
+    local dl
+    dl=$(pick_downloader)
+    if [[ -z "$dl" ]]; then
+        err "需要 curl 或 wget 以下载更新"
+        return 1
+    fi
+    local tmp
+    tmp=$(mktemp)
+    if [[ "$dl" == "curl" ]]; then
+        curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; err "下载失败（curl）"; return 1; }
+    else
+        wget -q "$url" -O "$tmp" || { rm -f "$tmp"; err "下载失败（wget）"; return 1; }
+    fi
+    # 简单校验：文件非空且包含 main 函数标识
+    if [[ ! -s "$tmp" ]] || ! grep -q "main()" "$tmp"; then
+        rm -f "$tmp"; err "下载的文件不合法，更新中止"
+        return 1
+    fi
+    # 保留执行权限，原子替换
+    chmod --reference="$self_path" "$tmp" 2>/dev/null || chmod +x "$tmp" || true
+    # 若需要 sudo 覆盖
+    if [[ -w "$self_path" ]]; then
+        mv "$tmp" "$self_path" || { rm -f "$tmp"; err "写入失败"; return 1; }
+    else
+        require_root_or_sudo
+        $SUDO_CMD mv "$tmp" "$self_path" || { rm -f "$tmp"; err "需要写入权限，更新失败"; return 1; }
+    fi
+    log "脚本已更新：$self_path"
+}
+
 require_root_or_sudo() {
     if [[ $(id -u) -ne 0 ]]; then
         if command -v sudo >/dev/null 2>&1; then
@@ -494,6 +543,86 @@ clear_forward_rules() {
     log "已清空端口转发规则（PREROUTING 链已刷新，CSV 已清空）"
 }
 
+# 使用参数添加端口转发：pf add <proto:any|tcp|udp> <pub_port> <dest_ip/host> <dest_port> [remark]
+pf_add_from_args() {
+    require_root_or_sudo
+    ensure_nat_table
+    mkdir_p_rules_dir
+    local proto pub host dip dp remark
+    proto="$1"; pub="$2"; host="$3"; dp="$4"; remark="${5:-}"
+    if [[ -z "$proto" || -z "$pub" || -z "$host" || -z "$dp" ]]; then err "参数不足：pf add <proto> <pub> <dip/host> <dp> [remark]"; return 1; fi
+    case "$proto" in any|tcp|udp) : ;; *) err "协议无效: $proto"; return 1 ;; esac
+    if ! [[ "$pub" =~ ^[0-9]+$ ]]; then err "端口无效: $pub"; return 1; fi
+    if ! [[ "$dp" =~ ^[0-9]+$ ]]; then err "目标端口无效: $dp"; return 1; fi
+    dip=$(resolve_host "$host"); [[ -z "$dip" ]] && err "无法解析目标: $host" && return 1
+
+    # 添加 nft 规则
+    if [[ "$proto" == "tcp" || "$proto" == "any" ]]; then
+        if ! $SUDO_CMD nft add rule ip nat PREROUTING tcp dport "$pub" dnat to "$dip":"$dp"; then
+            err "添加 TCP 规则失败"; return 1
+        fi
+        $SUDO_CMD nft insert rule ip filter FORWARD ip daddr "$dip" tcp dport "$dp" accept >/dev/null 2>&1 || \
+        $SUDO_CMD nft add rule ip filter FORWARD ip daddr "$dip" tcp dport "$dp" accept >/dev/null 2>&1 || true
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "any" ]]; then
+        if ! $SUDO_CMD nft add rule ip nat PREROUTING udp dport "$pub" dnat to "$dip":"$dp"; then
+            err "添加 UDP 规则失败"; return 1
+        fi
+        $SUDO_CMD nft insert rule ip filter FORWARD ip daddr "$dip" udp dport "$dp" accept >/dev/null 2>&1 || \
+        $SUDO_CMD nft add rule ip filter FORWARD ip daddr "$dip" udp dport "$dp" accept >/dev/null 2>&1 || true
+    fi
+
+    auto_enable_masquerade_default_eth0 || true
+
+    # 更新注册表：写入记录并聚合 any
+    mkdir_p_rules_dir
+    touch "$FORWARD_REG"
+    local tmp; tmp=$(mktemp)
+    $SUDO_CMD awk -F',' -v p="$pub" -v pr="$proto" -v ip="$dip" -v dp="$dp" -v r="$remark" 'BEGIN{OFS=","}
+        { keep=1; if ($1==p && $3==ip && $4==dp) { keep=0; } if(keep) print $0 }
+        END { if (pr=="") pr="any"; print p, pr, ip, dp, r }' "$FORWARD_REG" > "$tmp"
+    $SUDO_CMD mv "$tmp" "$FORWARD_REG"
+    sync_forward_registry || true
+    log "已添加端口转发: $proto $pub -> $dip:$dp${remark:+ ($remark)}"
+}
+
+# 使用参数删除端口转发：pf del <proto:any|tcp|udp> <pub_port> <dest_ip/host> <dest_port>
+pf_del_from_args() {
+    require_root_or_sudo
+    ensure_nat_table
+    mkdir_p_rules_dir
+    local proto pub host dip dp
+    proto="$1"; pub="$2"; host="$3"; dp="$4"
+    if [[ -z "$proto" || -z "$pub" || -z "$host" || -z "$dp" ]]; then err "参数不足：pf del <proto> <pub> <dip/host> <dp>"; return 1; fi
+    case "$proto" in any|tcp|udp) : ;; *) err "协议无效: $proto"; return 1 ;; esac
+    if ! [[ "$pub" =~ ^[0-9]+$ ]]; then err "端口无效: $pub"; return 1; fi
+    if ! [[ "$dp" =~ ^[0-9]+$ ]]; then err "目标端口无效: $dp"; return 1; fi
+    dip=$(resolve_host "$host"); [[ -z "$dip" ]] && err "无法解析目标: $host" && return 1
+
+    local out handles fout fhandles
+    out=$($SUDO_CMD nft -a list chain ip nat PREROUTING 2>/dev/null || true)
+    if [[ "$proto" == "tcp" || "$proto" == "any" ]]; then
+        handles=$(echo "$out" | awk -v p="$pub" -v ip="$dip" -v dp="$dp" '/tcp dport/ && $0 ~ ("dport " p) && $0 ~ ("dnat to " ip ":" dp) {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+        while read -r h; do [[ -n "$h" ]] && $SUDO_CMD nft delete rule ip nat PREROUTING handle "$h" || true; done <<< "$handles"
+        fout=$($SUDO_CMD nft -a list chain ip filter FORWARD 2>/dev/null || true)
+        fhandles=$(echo "$fout" | awk -v ip="$dip" -v dp="$dp" '/ip daddr/ && /tcp dport/ && $0 ~ ("ip daddr " ip) && $0 ~ ("tcp dport " dp) {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+        while read -r fh; do [[ -n "$fh" ]] && $SUDO_CMD nft delete rule ip filter FORWARD handle "$fh" || true; done <<< "$fhandles"
+    fi
+    if [[ "$proto" == "udp" || "$proto" == "any" ]]; then
+        handles=$(echo "$out" | awk -v p="$pub" -v ip="$dip" -v dp="$dp" '/udp dport/ && $0 ~ ("dport " p) && $0 ~ ("dnat to " ip ":" dp) {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+        while read -r h; do [[ -n "$h" ]] && $SUDO_CMD nft delete rule ip nat PREROUTING handle "$h" || true; done <<< "$handles"
+        fout=$($SUDO_CMD nft -a list chain ip filter FORWARD 2>/dev/null || true)
+        fhandles=$(echo "$fout" | awk -v ip="$dip" -v dp="$dp" '/ip daddr/ && /udp dport/ && $0 ~ ("ip daddr " ip) && $0 ~ ("udp dport " dp) {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+        while read -r fh; do [[ -n "$fh" ]] && $SUDO_CMD nft delete rule ip filter FORWARD handle "$fh" || true; done <<< "$fhandles"
+    fi
+
+    local tmp; tmp=$(mktemp)
+    $SUDO_CMD awk -F',' -v p="$pub" -v pr="$proto" -v ip="$dip" -v dp="$dp" 'BEGIN{OFS=","}
+        { if ($1==p && $3==ip && $4==dp && (pr=="any" || $2==pr)) next; print $0 }' "$FORWARD_REG" > "$tmp"
+    $SUDO_CMD mv "$tmp" "$FORWARD_REG"
+    log "已移除端口转发: $proto $pub -> $dip:$dp"
+}
+
 # 启动时确保 FORWARD 链存在必要的 accept 规则（根据 CSV 聚合）
 sync_forward_filter_accept() {
     require_root_or_sudo
@@ -538,20 +667,34 @@ list_masquerade() {
     out=$($SUDO_CMD nft -a list chain ip nat POSTROUTING 2>/dev/null || true)
     ifaces=$(echo "$out" | awk '{if($0 ~ /masquerade/){iface=""; handle=""; for(i=1;i<=NF;i++){if($i=="oifname"){iface=$(i+1)} else if($i=="handle"){handle=$(i+1)}}; gsub(/"/,"",iface); if(iface!="") printf("%s\n", iface)}}' | sort -u)
     echo
-    if [[ -z "$ifaces" ]]; then echo "masquerade: 未开启（默认网卡 eth0）"; else echo "masquerade: 已开启于接口 -> $ifaces"; fi
+    if [[ -z "$ifaces" ]]; then echo "masquerade: 未开启（默认接口 eth0/enp3s0/ens33）"; else echo "masquerade: 已开启于接口 -> $ifaces"; fi
     echo
 }
 
 auto_enable_masquerade_default_eth0() {
     require_root_or_sudo
     ensure_nat_table
-    local has
-    has=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | grep -c "masquerade" || true)
-    if [[ "${has:-0}" -ge 1 ]]; then return 0; fi
-    if list_net_ifaces | grep -qx "eth0"; then
-        $SUDO_CMD nft add rule ip nat POSTROUTING oifname "eth0" masquerade >/dev/null 2>&1 || true
-        log "检测到未开启 masquerade；已自动在 eth0 启用"
+    local iface
+    iface=$(pick_available_default_iface)
+    if [[ -z "$iface" ]]; then
+        warn "未找到默认候选接口 eth0/enp3s0/ens33；跳过自动开启"
+        return 0
     fi
+    # 若该候选接口尚未启用 masquerade，则自动添加
+    local has_iface
+    has_iface=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk -v want="$iface" 'BEGIN{f=0}
+        /masquerade/ {
+            for(i=1;i<=NF;i++){
+                if($i=="oifname" && $(i+1)!="!="){
+                    iface=$(i+1); gsub(/"/,"",iface);
+                    if(iface==want){ f=1; break }
+                }
+            }
+        }
+        END{print f}')
+    if [[ "${has_iface:-0}" -ge 1 ]]; then return 0; fi
+    $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade >/dev/null 2>&1 || true
+    log "检测到默认接口未启用 masquerade；已自动在 $iface 启用"
 }
 
 list_net_ifaces() {
@@ -565,8 +708,11 @@ enable_masquerade() {
     list_net_ifaces | tr '\n' ' ' | sed 's/ $//' || true
     echo
     local iface
-    read -rp "选择接口（默认 eth0，输入0返回）：" iface || true
-    [[ -z "${iface:-}" ]] && iface="eth0"
+    read -rp "选择接口（默认 eth0/enp3s0/ens33，输入0返回）：" iface || true
+    if [[ -z "${iface:-}" ]]; then
+        iface=$(pick_available_default_iface)
+        [[ -z "$iface" ]] && iface="eth0"
+    fi
     [[ "$iface" == "0" ]] && return 0
     $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade || true
     log "已在接口 $iface 启用 masquerade"
@@ -622,23 +768,39 @@ get_set_elements_compact() {
     echo "$elems"
 }
 
+# 候选默认外网接口名称
+default_nat_iface_candidates() { echo "eth0 enp3s0 ens33"; }
+
+# 选择第一个可用的默认外网接口（存在于当前系统的链路）
+pick_available_default_iface() {
+    local candidates ifaces c
+    candidates=$(default_nat_iface_candidates)
+    ifaces=$(list_net_ifaces)
+    for c in $candidates; do
+        if echo "$ifaces" | grep -qx "$c"; then
+            echo "$c"; return 0
+        fi
+    done
+    echo ""; return 1
+}
+
 # 判断 masquerade 是否开启（任意接口）
 is_masquerade_enabled() {
     require_root_or_sudo
     ensure_nat_table
-    # 仅当存在针对 eth0 的 masquerade 规则时认为已开启
-    local has_eth0
-    has_eth0=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk 'BEGIN{f=0}
+    # 存在 eth0/enp3s0/ens33 任一接口的 masquerade 则视为开启
+    local has_any
+    has_any=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk 'BEGIN{f=0}
         /masquerade/ {
             for(i=1;i<=NF;i++){
                 if($i=="oifname" && $(i+1)!="!="){
                     iface=$(i+1); gsub(/"/,"",iface);
-                    if(iface=="eth0"){ f=1; break }
+                    if(iface=="eth0" || iface=="enp3s0" || iface=="ens33"){ f=1; break }
                 }
             }
         }
         END{print f}')
-    [[ "${has_eth0:-0}" -ge 1 ]]
+    [[ "${has_any:-0}" -ge 1 ]]
 }
 
 # 简化版状态（默认）
@@ -814,25 +976,22 @@ usage() {
 
 子命令:
     init                        初始化并确保 nftables 结构就绪
-    wl-add <IP/CIDR>            将 IP/CIDR 加入白名单（兼容旧命令）
-    wl-del <IP/CIDR>            从白名单移除 IP/CIDR（兼容旧命令）
-    wl-clear                    清空白名单（兼容旧命令）
-    bl-add <IP/CIDR>            将 IP/CIDR 加入黑名单（兼容旧命令）
-    bl-del <IP/CIDR>            从黑名单移除 IP/CIDR（兼容旧命令）
-    bl-clear                    清空黑名单（兼容旧命令）
     wl add|del|clear [IP/CIDR]  新版分组命令：白名单增删清
     bl add|del|clear [IP/CIDR]  新版分组命令：黑名单增删清
     status [wl|bl|pf|debug]     简化状态；支持单独显示白/黑名单、转发规则；debug 为详细版
     save                        保存当前完整 nft 规则到配置目录
     load                        从配置目录加载已保存的 nft 规则
+    update                      从仓库拉取最新 nft-mgmt.sh 并覆盖当前脚本
 
-端口转发相关选项：
-    -pf, --port-forward         进入端口转发管理菜单
-    -pfl, --pf-list             列出当前端口转发规则
-    -pfa, --pf-add              添加端口转发规则
-    -pfd, --pf-del              删除端口转发规则
-    -pfc, --pf-clear            清空所有端口转发规则
-    -pfm, --pf-masq             管理 masquerade 设置
+端口转发（pf）与 masquerade（pfm）命令：
+    pf                         进入端口转发管理菜单
+    pf add <proto> <pub> <dip/host> <dp> [remark]
+                               通过参数添加端口转发（proto: any|tcp|udp）
+    pf del <proto> <pub> <dip/host> <dp>
+                               通过参数删除端口转发（精准删除，无需备注）
+    pf clear                   清空所有端口转发规则
+    pfm on                     启用默认接口的 masquerade（eth0/enp3s0/ens33）
+    pfm off                    关闭当前开启的默认接口 masquerade（需交互选择）
 
 说明:
     - 白名单集合为空时，不限制黑名单以外的 IP 访问；非空时，仅允许白名单访问。
@@ -926,15 +1085,83 @@ main() {
             ;;
         save) save_rules ;;
         load) load_rules ;;
-        -pf|--port-forward) main_menu_forward ;;
-        -pfl|--pf-list) list_current_forwards ;;
-        -pfa|--pf-add) add_forward_rule ;;
-        -pfd|--pf-del) delete_forward_rules ;;
-        -pfc|--pf-clear) clear_forward_rules ;;
-        -pfm|--pf-masq) masquerade_menu ;;
+        update) do_update_self ;;
+        pf)
+            case "${1:-}" in
+                add) shift || true; pf_add_from_args "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+                del)
+                    shift || true
+                    if [ -z "${1:-}" ]; then
+                        delete_forward_rules
+                    else
+                        pf_del_from_args "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+                    fi
+                    ;;
+                clear) clear_forward_rules ;;
+                "") main_menu_forward ;;
+                *) err "未知 pf 子命令"; usage; exit 1 ;;
+            esac
+            ;;
+        pfm)
+            case "${1:-}" in
+                on) auto_enable_masquerade_default_eth0 ;;
+                off) disable_masquerade ;;
+                "") masquerade_menu ;;
+                *) err "未知 pfm 子命令"; usage; exit 1 ;;
+            esac
+            ;;
         ""|-h|--help) usage ;;
         *) err "未知子命令: $cmd"; usage; exit 1 ;;
     esac
+}
+
+# 远程更新源（raw 地址）
+UPDATE_SRC_URL="https://raw.githubusercontent.com/PandaRyshan/soscripts/refs/heads/main/scripts/nft-mgmt.sh"
+
+# 检查可用下载器
+pick_downloader() {
+    if command -v curl >/dev/null 2>&1; then echo "curl"; return 0; fi
+    if command -v wget >/dev/null 2>&1; then echo "wget"; return 0; fi
+    echo ""; return 1
+}
+
+# 执行自我更新（下载覆盖当前脚本文件），不重启服务
+do_update_self() {
+    local url="$UPDATE_SRC_URL"
+    local self_path
+    self_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    if [[ -z "$self_path" || ! -f "$self_path" ]]; then
+        err "无法定位当前脚本路径，更新中止"
+        return 1
+    fi
+    local dl
+    dl=$(pick_downloader)
+    if [[ -z "$dl" ]]; then
+        err "需要 curl 或 wget 以下载更新"
+        return 1
+    fi
+    local tmp
+    tmp=$(mktemp)
+    if [[ "$dl" == "curl" ]]; then
+        curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; err "下载失败（curl）"; return 1; }
+    else
+        wget -q "$url" -O "$tmp" || { rm -f "$tmp"; err "下载失败（wget）"; return 1; }
+    fi
+    # 简单校验：文件非空且包含 main 函数标识
+    if [[ ! -s "$tmp" ]] || ! grep -q "main()" "$tmp"; then
+        rm -f "$tmp"; err "下载的文件不合法，更新中止"
+        return 1
+    fi
+    # 保留执行权限，原子替换
+    chmod --reference="$self_path" "$tmp" 2>/dev/null || chmod +x "$tmp" || true
+    # 若需要 sudo 覆盖
+    if [[ -w "$self_path" ]]; then
+        mv "$tmp" "$self_path" || { rm -f "$tmp"; err "写入失败"; return 1; }
+    else
+        require_root_or_sudo
+        $SUDO_CMD mv "$tmp" "$self_path" || { rm -f "$tmp"; err "需要写入权限，更新失败"; return 1; }
+    fi
+    log "脚本已更新：$self_path"
 }
 
 main "$@"
