@@ -88,9 +88,7 @@ ensure_struct() {
         $SUDO_CMD nft insert rule inet filter forward ip6 saddr @ip_blacklist_v6 counter drop >/dev/null 2>&1 || \
         $SUDO_CMD nft add rule inet filter forward ip6 saddr @ip_blacklist_v6 counter drop >/dev/null 2>&1 || true
     # 插入白名单控制跳转（靠前，位于黑名单后）
-    $SUDO_CMD nft list chain inet filter input 2>/dev/null | grep -qE 'jump WL_CTRL' || \
-        $SUDO_CMD nft insert rule inet filter input jump WL_CTRL >/dev/null 2>&1 || \
-        $SUDO_CMD nft add rule inet filter input jump WL_CTRL >/dev/null 2>&1 || true
+    ensure_single_jump_wl_ctrl || true
     # WL_CTRL 子链规则编排：当白名单非空时，非白名单拒绝；当空时不限制
     sync_wl_ctrl || true
 }
@@ -150,6 +148,30 @@ clear_duplicate_blacklist_rules() {
         done
     done
     # log "已清除重复的黑名单规则"
+}
+
+# 确保 input 链中仅存在一个 'jump WL_CTRL'，并自动去重
+ensure_single_jump_wl_ctrl() {
+    require_root_or_sudo
+    # 若链不存在则直接返回（由 ensure_struct 负责创建）
+    $SUDO_CMD nft list chain inet filter input >/dev/null 2>&1 || return 0
+    local out; out=$($SUDO_CMD nft -a list chain inet filter input 2>/dev/null || true)
+    # 收集匹配 'jump WL_CTRL' 的规则句柄（按链中出现顺序）
+    local handles=()
+    while IFS= read -r h; do [[ -n "$h" ]] && handles+=("$h"); done < <(
+        echo "$out" | awk '{if($0 ~ /jump/ && $0 ~ /WL_CTRL/){for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}}'
+    )
+    if [[ ${#handles[@]} -eq 0 ]]; then
+        # 不存在则插入一条（优先 insert，失败回退 add）
+        $SUDO_CMD nft insert rule inet filter input jump WL_CTRL >/dev/null 2>&1 || \
+        $SUDO_CMD nft add rule inet filter input jump WL_CTRL >/dev/null 2>&1 || true
+        return 0
+    fi
+    # 存在多条：保留第一条，删除后续重复项
+    local i
+    for (( i=1; i<${#handles[@]}; i++ )); do
+        $SUDO_CMD nft delete rule inet filter input handle "${handles[$i]}" >/dev/null 2>&1 || true
+    done
 }
 
 # 判断是否是危险的黑名单目标（回环、本机地址、常见内网段）
@@ -595,7 +617,7 @@ get_set_elements_compact() {
                 s = s " " line
             }
         }
-    ' | tr -s ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d ',' )
+    ' | tr '\t' ' ' | tr -s ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d ',' )
     echo "$elems"
 }
 
@@ -603,7 +625,19 @@ get_set_elements_compact() {
 is_masquerade_enabled() {
     require_root_or_sudo
     ensure_nat_table
-    $SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk '/masquerade/{print 1; exit} END{print 0}' | grep -qx '1'
+    # 仅当存在针对 eth0 的 masquerade 规则时认为已开启
+    local has_eth0
+    has_eth0=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk 'BEGIN{f=0}
+        /masquerade/ {
+            for(i=1;i<=NF;i++){
+                if($i=="oifname" && $(i+1)!="!="){
+                    iface=$(i+1); gsub(/"/,"",iface);
+                    if(iface=="eth0"){ f=1; break }
+                }
+            }
+        }
+        END{print f}')
+    [[ "${has_eth0:-0}" -ge 1 ]]
 }
 
 # 简化版状态（默认）
@@ -614,16 +648,16 @@ status_simple() {
     local bl_v4 bl_v6 bl_all
     bl_v4=$(get_set_elements_compact ip_blacklist_v4)
     bl_v6=$(get_set_elements_compact ip_blacklist_v6)
-    bl_all=$(printf "%s %s" "$bl_v4" "$bl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
-    if [[ -z "$bl_all" ]]; then echo " 无"; else echo " $bl_all"; fi
+    bl_all=$(printf "%s %s" "$bl_v4" "$bl_v6" | tr '\t' ' ' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$bl_all" ]]; then echo "无"; else echo "$(echo "$bl_all" | sed 's/ /  /g')"; fi
     echo
     # 白名单
     echo "白名单:"
     local wl_v4 wl_v6 wl_all
     wl_v4=$(get_set_elements_compact ip_whitelist_v4)
     wl_v6=$(get_set_elements_compact ip_whitelist_v6)
-    wl_all=$(printf "%s %s" "$wl_v4" "$wl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
-    if [[ -z "$wl_all" ]]; then echo " 无"; else echo " $wl_all"; fi
+    wl_all=$(printf "%s %s" "$wl_v4" "$wl_v6" | tr '\t' ' ' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$wl_all" ]]; then echo "无"; else echo "$(echo "$wl_all" | sed 's/ /  /g')"; fi
     echo
     # 转发规则
     echo "转发规则:"
@@ -636,9 +670,9 @@ status_simple() {
             i=$((i+1))
             printf "%d) %s %s -> %s:%s%s\n" "$i" "$proto" "$pub" "$dip" "$dp" "${remark:+ ($remark)}"
         done < "$FORWARD_REG"
-        [[ "$i" -eq 0 ]] && echo " 无"
+        [[ "$i" -eq 0 ]] && echo "无"
     else
-        echo " 无"
+        echo "无"
     fi
     echo
     # masquerade 状态
@@ -653,8 +687,8 @@ status_wl() {
     local wl_v4 wl_v6 wl_all
     wl_v4=$(get_set_elements_compact ip_whitelist_v4)
     wl_v6=$(get_set_elements_compact ip_whitelist_v6)
-    wl_all=$(printf "%s %s" "$wl_v4" "$wl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
-    if [[ -z "$wl_all" ]]; then echo " 无"; else echo " $wl_all"; fi
+    wl_all=$(printf "%s %s" "$wl_v4" "$wl_v6" | tr '\t' ' ' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$wl_all" ]]; then echo "无"; else echo "$(echo "$wl_all" | sed 's/ /  /g')"; fi
 }
 
 # 仅显示黑名单
@@ -664,8 +698,8 @@ status_bl() {
     local bl_v4 bl_v6 bl_all
     bl_v4=$(get_set_elements_compact ip_blacklist_v4)
     bl_v6=$(get_set_elements_compact ip_blacklist_v6)
-    bl_all=$(printf "%s %s" "$bl_v4" "$bl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
-    if [[ -z "$bl_all" ]]; then echo " 无"; else echo " $bl_all"; fi
+    bl_all=$(printf "%s %s" "$bl_v4" "$bl_v6" | tr '\t' ' ' | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$bl_all" ]]; then echo "无"; else echo "$(echo "$bl_all" | sed 's/ /  /g')"; fi
 }
 
 # 仅显示转发规则
