@@ -139,18 +139,17 @@ clear_duplicate_blacklist_rules() {
     require_root_or_sudo
     local chains="input forward prerouting"
     for chain in $chains; do
-        # 获取当前链中的所有规则句柄
+        # 获取当前链中的所有规则句柄（使用 awk 过滤，避免 pipefail 在无匹配时导致退出）
         local handles
         handles=$($SUDO_CMD nft -a list chain inet filter "$chain" 2>/dev/null | \
-            grep -E "(ip saddr @ip_blacklist_v4|ip6 saddr @ip_blacklist_v6).*drop" | \
-            awk '{print $NF}' | sort -u)
-        
+            awk '/(ip saddr @ip_blacklist_v4|ip6 saddr @ip_blacklist_v6).*drop/ {print $NF}' | sort -u)
+
         # 为每个规则句柄删除规则
         for handle in $handles; do
             $SUDO_CMD nft delete rule inet filter "$chain" handle "$handle" >/dev/null 2>&1 || true
         done
     done
-    log "已清除重复的黑名单规则"
+    # log "已清除重复的黑名单规则"
 }
 
 # 判断是否是危险的黑名单目标（回环、本机地址、常见内网段）
@@ -374,6 +373,8 @@ add_forward_rule() {
         $SUDO_CMD nft add rule ip filter FORWARD ip daddr "$dip" udp dport "$dp" accept >/dev/null 2>&1 || true
     fi
 
+    auto_enable_masquerade_default_eth0 || true
+
     # 更新注册表：合并为 any（若已有另一协议）
     mkdir_p_rules_dir
     touch "$FORWARD_REG"
@@ -518,6 +519,18 @@ list_masquerade() {
     echo
 }
 
+auto_enable_masquerade_default_eth0() {
+    require_root_or_sudo
+    ensure_nat_table
+    local has
+    has=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | grep -c "masquerade" || true)
+    if [[ "${has:-0}" -ge 1 ]]; then return 0; fi
+    if list_net_ifaces | grep -qx "eth0"; then
+        $SUDO_CMD nft add rule ip nat POSTROUTING oifname "eth0" masquerade >/dev/null 2>&1 || true
+        log "检测到未开启 masquerade；已自动在 eth0 启用"
+    fi
+}
+
 list_net_ifaces() {
     ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '($0!~/@/){print $0}'
 }
@@ -561,6 +574,116 @@ disable_masquerade() {
 print_forward_status() {
     list_current_forwards
     list_masquerade
+}
+
+# 紧凑打印集合元素（单行，空则返回空字符串）
+get_set_elements_compact() {
+    local set_name="$1"
+    local out elems
+    out=$($SUDO_CMD nft list set inet filter "$set_name" 2>/dev/null || true)
+    # 解析 elements，无论元素在同一行还是多行都能提取
+    elems=$(echo "$out" | awk '
+        /elements/ {
+            m=$0
+            s=""
+            if (m ~ /\{/){ sub(/.*\{/, "", m) } else { m="" }
+            if (m ~ /\}/){ sub(/\}.*/, "", m); s=m; print s; exit }
+            s=m
+            while (getline > 0) {
+                line=$0
+                if (line ~ /\}/) { sub(/\}.*/, "", line); s = s " " line; print s; exit }
+                s = s " " line
+            }
+        }
+    ' | tr -s ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d ',' )
+    echo "$elems"
+}
+
+# 判断 masquerade 是否开启（任意接口）
+is_masquerade_enabled() {
+    require_root_or_sudo
+    ensure_nat_table
+    $SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk '/masquerade/{print 1; exit} END{print 0}' | grep -qx '1'
+}
+
+# 简化版状态（默认）
+status_simple() {
+    ensure_struct
+    # 黑名单
+    echo "黑名单:"
+    local bl_v4 bl_v6 bl_all
+    bl_v4=$(get_set_elements_compact ip_blacklist_v4)
+    bl_v6=$(get_set_elements_compact ip_blacklist_v6)
+    bl_all=$(printf "%s %s" "$bl_v4" "$bl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$bl_all" ]]; then echo " 无"; else echo " $bl_all"; fi
+    echo
+    # 白名单
+    echo "白名单:"
+    local wl_v4 wl_v6 wl_all
+    wl_v4=$(get_set_elements_compact ip_whitelist_v4)
+    wl_v6=$(get_set_elements_compact ip_whitelist_v6)
+    wl_all=$(printf "%s %s" "$wl_v4" "$wl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$wl_all" ]]; then echo " 无"; else echo " $wl_all"; fi
+    echo
+    # 转发规则
+    echo "转发规则:"
+    require_root_or_sudo; ensure_nat_table; mkdir_p_rules_dir; sync_forward_registry || true
+    if [[ -f "$FORWARD_REG" ]]; then
+        local i=0
+        while IFS=',' read -r pub proto dip dp remark; do
+            [[ -z "$pub" || -z "$dip" || -z "$dp" ]] && continue
+            [[ -z "$proto" ]] && proto="any"
+            i=$((i+1))
+            printf "%d) %s %s -> %s:%s%s\n" "$i" "$proto" "$pub" "$dip" "$dp" "${remark:+ ($remark)}"
+        done < "$FORWARD_REG"
+        [[ "$i" -eq 0 ]] && echo " 无"
+    else
+        echo " 无"
+    fi
+    echo
+    # masquerade 状态
+    echo "masquerade:"
+    if is_masquerade_enabled; then echo " 开启"; else echo " 未开启"; fi
+}
+
+# 仅显示白名单
+status_wl() {
+    ensure_struct
+    echo "白名单:"
+    local wl_v4 wl_v6 wl_all
+    wl_v4=$(get_set_elements_compact ip_whitelist_v4)
+    wl_v6=$(get_set_elements_compact ip_whitelist_v6)
+    wl_all=$(printf "%s %s" "$wl_v4" "$wl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$wl_all" ]]; then echo " 无"; else echo " $wl_all"; fi
+}
+
+# 仅显示黑名单
+status_bl() {
+    ensure_struct
+    echo "黑名单:"
+    local bl_v4 bl_v6 bl_all
+    bl_v4=$(get_set_elements_compact ip_blacklist_v4)
+    bl_v6=$(get_set_elements_compact ip_blacklist_v6)
+    bl_all=$(printf "%s %s" "$bl_v4" "$bl_v6" | tr -s ' ' | sed 's/^ *//; s/ *$//')
+    if [[ -z "$bl_all" ]]; then echo " 无"; else echo " $bl_all"; fi
+}
+
+# 仅显示转发规则
+status_pf() {
+    require_root_or_sudo; ensure_nat_table; mkdir_p_rules_dir; sync_forward_registry || true
+    echo "转发规则:"
+    if [[ -f "$FORWARD_REG" ]]; then
+        local i=0
+        while IFS=',' read -r pub proto dip dp remark; do
+            [[ -z "$pub" || -z "$dip" || -z "$dp" ]] && continue
+            [[ -z "$proto" ]] && proto="any"
+            i=$((i+1))
+            printf "%d) %s %s -> %s:%s%s\n" "$i" "$proto" "$pub" "$dip" "$dp" "${remark:+ ($remark)}"
+        done < "$FORWARD_REG"
+        [[ "$i" -eq 0 ]] && echo " 无"
+    else
+        echo " 无"
+    fi
 }
 
 init() {
@@ -647,13 +770,15 @@ usage() {
 
 子命令:
     init                        初始化并确保 nftables 结构就绪
-    wl-add <IP/CIDR>            将 IP 或 CIDR 加入白名单（集合非空时仅允许白名单）
-    wl-del <IP/CIDR>            从白名单移除 IP 或 CIDR
-    wl-clear                    清空白名单（集合为空时不限制）
-    bl-add <IP/CIDR>            将 IP 或 CIDR 加入黑名单（立即 drop）
-    bl-del <IP/CIDR>            从黑名单移除 IP 或 CIDR
-    bl-clear                    清空黑名单
-    status                      显示当前结构与元素
+    wl-add <IP/CIDR>            将 IP/CIDR 加入白名单（兼容旧命令）
+    wl-del <IP/CIDR>            从白名单移除 IP/CIDR（兼容旧命令）
+    wl-clear                    清空白名单（兼容旧命令）
+    bl-add <IP/CIDR>            将 IP/CIDR 加入黑名单（兼容旧命令）
+    bl-del <IP/CIDR>            从黑名单移除 IP/CIDR（兼容旧命令）
+    bl-clear                    清空黑名单（兼容旧命令）
+    wl add|del|clear [IP/CIDR]  新版分组命令：白名单增删清
+    bl add|del|clear [IP/CIDR]  新版分组命令：黑名单增删清
+    status [wl|bl|pf|debug]     简化状态；支持单独显示白/黑名单、转发规则；debug 为详细版
     save                        保存当前完整 nft 规则到配置目录
     load                        从配置目录加载已保存的 nft 规则
 
@@ -728,7 +853,33 @@ main() {
         bl-add) bl_add "${1:-}" ;;
         bl-del) bl_del "${1:-}" ;;
         bl-clear) bl_clear ;;
-        status) status ;;
+        # status 主命令支持简化与子视图：默认简化；status wl/bl/pf 支持单独显示
+        status)
+            case "${1:-}" in
+                wl) status_wl ;;
+                bl) status_bl ;;
+                pf) status_pf ;;
+                debug) status ;;    # 保留旧版详细输出为 debug
+                *) status_simple ;;
+            esac
+            ;;
+        # 新增分组子命令：wl add/del/clear 与 bl add/del/clear
+        wl)
+            case "${1:-}" in
+                add) shift || true; wl_add "${1:-}" ;;
+                del|rm) shift || true; wl_del "${1:-}" ;;
+                clear|flush) wl_clear ;;
+                *) err "未知 wl 子命令"; usage; exit 1 ;;
+            esac
+            ;;
+        bl)
+            case "${1:-}" in
+                add) shift || true; bl_add "${1:-}" ;;
+                del|rm) shift || true; bl_del "${1:-}" ;;
+                clear|flush) bl_clear ;;
+                *) err "未知 bl 子命令"; usage; exit 1 ;;
+            esac
+            ;;
         save) save_rules ;;
         load) load_rules ;;
         -pf|--port-forward) main_menu_forward ;;
