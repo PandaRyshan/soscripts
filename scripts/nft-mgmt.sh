@@ -19,8 +19,10 @@ log() { echo "[${SCRIPT_NAME}] $*"; }
 err() { echo "[${SCRIPT_NAME}][ERROR] $*" >&2; }
 warn() { echo "[${SCRIPT_NAME}][WARN] $*"; }
 
-# 远程更新源（raw 地址）
-UPDATE_SRC_URL="https://raw.githubusercontent.com/PandaRyshan/soscripts/refs/heads/main/scripts/nft-mgmt.sh"
+# 远程更新源（raw 地址），可通过环境变量覆盖
+UPDATE_SRC_URL="${UPDATE_SRC_URL:-https://raw.githubusercontent.com/PandaRyshan/soscripts/refs/heads/main/scripts/nft-mgmt.sh}"
+# 更新目标路径，默认写入 /usr/share/scripts/nft-mgmt.sh，可通过环境变量 TARGET_UPDATE_PATH 覆盖
+TARGET_UPDATE_PATH="${TARGET_UPDATE_PATH:-/usr/share/scripts/nft-mgmt.sh}"
 
 # 检查可用下载器
 pick_downloader() {
@@ -31,41 +33,60 @@ pick_downloader() {
 
 # 执行自我更新（下载覆盖当前脚本文件），不重启服务
 do_update_self() {
+    # 可选参数：--proxy=URL 或 --proxy URL
+    local proxy=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --proxy=*) proxy="${1#--proxy=}" ;;
+            --proxy) shift; proxy="${1:-}" ;;
+            *) ;; # 忽略其他参数
+        esac
+        shift || true
+    done
+
     local url="$UPDATE_SRC_URL"
-    local self_path
-    self_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    if [[ -z "$self_path" || ! -f "$self_path" ]]; then
-        err "无法定位当前脚本路径，更新中止"
-        return 1
+    local target="$TARGET_UPDATE_PATH"
+
+    # 选择下载器：若为 socks 代理则优先使用 curl
+    local dl=""
+    if [[ -n "$proxy" && "$proxy" =~ ^socks ]]; then
+        if command -v curl >/dev/null 2>&1; then dl="curl"; fi
     fi
-    local dl
-    dl=$(pick_downloader)
+    if [[ -z "$dl" ]]; then dl=$(pick_downloader || true); fi
     if [[ -z "$dl" ]]; then
         err "需要 curl 或 wget 以下载更新"
         return 1
     fi
-    local tmp
-    tmp=$(mktemp)
+
+    local tmp; tmp=$(mktemp)
     if [[ "$dl" == "curl" ]]; then
-        curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; err "下载失败（curl）"; return 1; }
+        local curl_opts=( -fsSL --retry 3 --retry-delay 2 --retry-connrefused --connect-timeout 10 --max-time 60 )
+        [[ -n "$proxy" ]] && curl_opts+=( --proxy "$proxy" )
+        curl "${curl_opts[@]}" "$url" -o "$tmp" || { rm -f "$tmp"; err "下载失败（curl）"; return 1; }
     else
-        wget -q "$url" -O "$tmp" || { rm -f "$tmp"; err "下载失败（wget）"; return 1; }
+        local wget_opts=( -q --tries=3 --timeout=15 )
+        if [[ -n "$proxy" ]]; then
+            wget_opts+=( -e use_proxy=yes -e https_proxy="$proxy" -e http_proxy="$proxy" )
+        fi
+        wget "${wget_opts[@]}" "$url" -O "$tmp" || { rm -f "$tmp"; err "下载失败（wget）"; return 1; }
     fi
+
     # 简单校验：文件非空且包含 main 函数标识
     if [[ ! -s "$tmp" ]] || ! grep -q "main()" "$tmp"; then
-        rm -f "$tmp"; err "下载的文件不合法，更新中止"
-        return 1
+        rm -f "$tmp"; err "下载的文件不合法，更新中止"; return 1
     fi
-    # 保留执行权限，原子替换
-    chmod --reference="$self_path" "$tmp" 2>/dev/null || chmod +x "$tmp" || true
-    # 若需要 sudo 覆盖
-    if [[ -w "$self_path" ]]; then
-        mv "$tmp" "$self_path" || { rm -f "$tmp"; err "写入失败"; return 1; }
+
+    # 准备目标目录并写入（需要 root/sudo）
+    require_root_or_sudo
+    local tdir; tdir=$(dirname "$target")
+    $SUDO_CMD mkdir -p "$tdir" || { rm -f "$tmp"; err "创建目标目录失败：$tdir"; return 1; }
+    if [[ -f "$target" ]]; then
+        chmod --reference="$target" "$tmp" 2>/dev/null || chmod +x "$tmp" || true
     else
-        require_root_or_sudo
-        $SUDO_CMD mv "$tmp" "$self_path" || { rm -f "$tmp"; err "需要写入权限，更新失败"; return 1; }
+        chmod +x "$tmp" || true
     fi
-    log "脚本已更新：$self_path"
+    $SUDO_CMD mv "$tmp" "$target" || { rm -f "$tmp"; err "写入失败：$target"; return 1; }
+    log "脚本已更新：$target"
 }
 
 require_root_or_sudo() {
@@ -981,7 +1002,9 @@ usage() {
     status [wl|bl|pf|debug]     简化状态；支持单独显示白/黑名单、转发规则；debug 为详细版
     save                        保存当前完整 nft 规则到配置目录
     load                        从配置目录加载已保存的 nft 规则
-    update                      从仓库拉取最新 nft-mgmt.sh 并覆盖当前脚本
+    update [--proxy=URL]        从仓库拉取最新 nft-mgmt.sh 并写入目标路径
+                                 - 支持代理：如 --proxy=socks5://10.10.10.1:7799
+                                 - 环境变量覆盖：UPDATE_SRC_URL、TARGET_UPDATE_PATH
 
 端口转发（pf）与 masquerade（pfm）命令：
     pf                         进入端口转发管理菜单
@@ -1085,7 +1108,7 @@ main() {
             ;;
         save) save_rules ;;
         load) load_rules ;;
-        update) do_update_self ;;
+        update) do_update_self "$@" ;;
         pf)
             case "${1:-}" in
                 add) shift || true; pf_add_from_args "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
@@ -1113,55 +1136,6 @@ main() {
         ""|-h|--help) usage ;;
         *) err "未知子命令: $cmd"; usage; exit 1 ;;
     esac
-}
-
-# 远程更新源（raw 地址）
-UPDATE_SRC_URL="https://raw.githubusercontent.com/PandaRyshan/soscripts/refs/heads/main/scripts/nft-mgmt.sh"
-
-# 检查可用下载器
-pick_downloader() {
-    if command -v curl >/dev/null 2>&1; then echo "curl"; return 0; fi
-    if command -v wget >/dev/null 2>&1; then echo "wget"; return 0; fi
-    echo ""; return 1
-}
-
-# 执行自我更新（下载覆盖当前脚本文件），不重启服务
-do_update_self() {
-    local url="$UPDATE_SRC_URL"
-    local self_path
-    self_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    if [[ -z "$self_path" || ! -f "$self_path" ]]; then
-        err "无法定位当前脚本路径，更新中止"
-        return 1
-    fi
-    local dl
-    dl=$(pick_downloader)
-    if [[ -z "$dl" ]]; then
-        err "需要 curl 或 wget 以下载更新"
-        return 1
-    fi
-    local tmp
-    tmp=$(mktemp)
-    if [[ "$dl" == "curl" ]]; then
-        curl -fsSL "$url" -o "$tmp" || { rm -f "$tmp"; err "下载失败（curl）"; return 1; }
-    else
-        wget -q "$url" -O "$tmp" || { rm -f "$tmp"; err "下载失败（wget）"; return 1; }
-    fi
-    # 简单校验：文件非空且包含 main 函数标识
-    if [[ ! -s "$tmp" ]] || ! grep -q "main()" "$tmp"; then
-        rm -f "$tmp"; err "下载的文件不合法，更新中止"
-        return 1
-    fi
-    # 保留执行权限，原子替换
-    chmod --reference="$self_path" "$tmp" 2>/dev/null || chmod +x "$tmp" || true
-    # 若需要 sudo 覆盖
-    if [[ -w "$self_path" ]]; then
-        mv "$tmp" "$self_path" || { rm -f "$tmp"; err "写入失败"; return 1; }
-    else
-        require_root_or_sudo
-        $SUDO_CMD mv "$tmp" "$self_path" || { rm -f "$tmp"; err "需要写入权限，更新失败"; return 1; }
-    fi
-    log "脚本已更新：$self_path"
 }
 
 main "$@"
