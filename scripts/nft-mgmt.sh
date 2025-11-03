@@ -17,6 +17,7 @@ CONF_FILE="$CONF_DIR/nftrules.nft"
 
 log() { echo "[${SCRIPT_NAME}] $*"; }
 err() { echo "[${SCRIPT_NAME}][ERROR] $*" >&2; }
+warn() { echo "[${SCRIPT_NAME}][WARN] $*"; }
 
 require_root_or_sudo() {
     if [[ $(id -u) -ne 0 ]]; then
@@ -519,7 +520,7 @@ sync_forward_filter_accept() {
 ensure_forward_baseline() {
     require_root_or_sudo
     if ! $SUDO_CMD nft list chain ip filter FORWARD >/dev/null 2>&1; then
-        err "未检测到 ip filter FORWARD 链，无法添加状态回包放行"
+        warn "未检测到 ip filter FORWARD 链，无法添加状态回包放行"
         return 0
     fi
     # 已存在则跳过
@@ -758,12 +759,17 @@ save_rules() {
 
 load_rules() {
     require_root_or_sudo
+    local loaded=0
     if [[ ! -f "$CONF_FILE" ]]; then
-        err "未找到已保存的规则文件: $CONF_FILE"; exit 1
-    fi
-    # 加载 inet filter 规则
-    if ! $SUDO_CMD nft -f "$CONF_FILE"; then
-        err "加载规则失败：解析或应用 $CONF_FILE 出错"; exit 1
+        warn "未找到已保存的规则文件: $CONF_FILE；跳过加载，继续启动"
+    else
+        # 加载 inet filter 规则
+        if ! $SUDO_CMD nft -f "$CONF_FILE"; then
+            warn "加载规则失败：解析或应用 $CONF_FILE 出错；跳过加载，继续启动"
+        else
+            loaded=1
+            log "已加载 inet filter 规则"
+        fi
     fi
     # 加载后确保自定义结构与锚点一致（尤其是 WL_CTRL、黑名单拦截点）
     ensure_struct || true
@@ -775,7 +781,11 @@ load_rules() {
     sync_forward_filter_accept || true
     # 确保白名单控制逻辑与集合状态同步
     sync_wl_ctrl || true
-    log "已加载 inet filter 规则并恢复端口转发（来自 CSV）"
+    if [[ "$loaded" -eq 1 ]]; then
+        log "已加载 inet filter 规则并恢复端口转发（来自 CSV）"
+    else
+        log "未加载规则文件（已跳过/失败），已确保结构并从 CSV 恢复端口转发"
+    fi
 }
 
 # 根据 CSV 重新应用 PREROUTING 端口转发规则（支持 proto any/tcp/udp）
