@@ -1,8 +1,8 @@
-# soscripts - 系统安全与网络管理工具集
+# soscripts - 个人防火墙脚本合集
 
 ## 主要功能
 
-- **IP/端口白名单/黑名单管理** - 使用 nftables 管理入站流量
+- **IP/端口白名单/黑名单管理** - 使用 nftables 管理入站流量(对 docker 有效)
 - **端口转发管理** - 支持 TCP/UDP 端口转发
 - **TCP 连接监控** - 实时监控连接数，支持邮件预警
 - **fail2ban 集成** - 自动安装配置 fail2ban 防护
@@ -13,17 +13,6 @@
 
 ```bash
 curl -fsSL https://github.com/PandaRyshan/soscripts/raw/refs/heads/main/setup.sh | bash
-```
-
-或者下载脚本后执行：
-
-```bash
-# 下载安装脚本
-curl -fsSL https://github.com/PandaRyshan/soscripts/raw/refs/heads/main/setup.sh -o setup.sh
-
-# 赋予执行权限并运行
-chmod +x setup.sh
-sudo ./setup.sh
 ```
 
 安装完成后，可直接使用以下命令：
@@ -83,42 +72,35 @@ nft-mgmt [command] [arguments]
 
 #### 白名单管理
 ```bash
-nft-mgmt wl-add <IP/CIDR>      # 添加白名单 IP
-nft-mgmt wl-del <IP/CIDR>      # 删除白名单 IP  
-nft-mgmt wl-clear              # 清空白名单
+nft-mgmt status                # 打印所有规则
+nft-mgmt status <wl/bl/pf>     # 打印白名单/黑名单/端口转发规则
+```
+
+```bash
+nft-mgmt wl add <IP/CIDR>      # 添加白名单 IP
+nft-mgmt wl del <IP/CIDR>      # 删除白名单 IP  
+nft-mgmt wl clear              # 清空白名单
 ```
 
 #### 黑名单管理
 ```bash
-nft-mgmt bl-add <IP/CIDR>      # 添加黑名单 IP
-nft-mgmt bl-del <IP/CIDR>      # 删除黑名单 IP
-nft-mgmt bl-clear              # 清空黑名单
+nft-mgmt bl add <IP/CIDR>      # 添加黑名单 IP
+nft-mgmt bl del <IP/CIDR>      # 删除黑名单 IP
+nft-mgmt bl clear              # 清空黑名单
 ```
 
 #### 端口转发管理
 ```bash
-nft-mgmt forward-add           # 交互式添加端口转发
-nft-mgmt forward-del           # 交互式删除端口转发
-nft-mgmt forward-list          # 列出所有端口转发规则
+nft-mgmt pf list          # 列出所有端口转发规则
+nft-mgmt pf add           # 交互式添加端口转发菜单
+nft-mgmt pf del           # 交互式删除端口转发菜单
+nft-mgmt pf add <protocol> <src_ip> <src_port> <dst_ip> <dst_port>  # 添加端口转发规则
+nft-mgmt pf del <protocol> <src_ip> <src_port> <dst_ip> <dst_port>  # 删除端口转发规则
+nft-mgmt pfm <on/off>       # 启用/禁用 masquerade
 ```
 
 #### 系统管理
 ```bash
-nft-mgmt --ensure-struct        # 确保 nftables 结构存在
+nft-mgmt init                   # 初始化 nftables 结构
 nft-mgmt load                   # 加载配置
-```
-
-### 示例
-```bash
-# 添加白名单
-nft-mgmt wl-add 192.168.1.0/24
-nft-mgmt wl-add 2001:db8::/32
-
-# 添加黑名单
-nft-mgmt bl-add 203.0.113.5
-nft-mgmt bl-add 198.51.100.0/24
-
-# 管理端口转发
-nft-mgmt forward-add
-nft-mgmt forward-list
 ```
