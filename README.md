@@ -71,10 +71,6 @@ nft-mgmt [command] [arguments]
 ### 命令列表
 
 #### 白名单管理
-```bash
-nft-mgmt status                # 打印所有规则
-nft-mgmt status <wl/bl/pf>     # 打印白名单/黑名单/端口转发规则
-```
 
 ```bash
 nft-mgmt wl add <IP/CIDR>      # 添加白名单 IP
@@ -101,6 +97,8 @@ nft-mgmt pfm <on/off>       # 启用/禁用 masquerade
 
 #### 系统管理
 ```bash
+nft-mgmt status                # 打印所有规则
+nft-mgmt status <wl/bl/pf>     # 打印白名单/黑名单/端口转发规则
 nft-mgmt init                   # 初始化 nftables 结构
 nft-mgmt save                   # 保存规则表
 nft-mgmt load                   # 加载规则表
