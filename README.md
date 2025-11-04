@@ -102,5 +102,6 @@ nft-mgmt pfm <on/off>       # 启用/禁用 masquerade
 #### 系统管理
 ```bash
 nft-mgmt init                   # 初始化 nftables 结构
-nft-mgmt load                   # 加载配置
+nft-mgmt save                   # 保存规则表
+nft-mgmt load                   # 加载规则表
 ```
