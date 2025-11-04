@@ -99,7 +99,7 @@ nft-mgmt pfm <on/off>       # 启用/禁用 masquerade
 ```bash
 nft-mgmt status                # 打印所有规则
 nft-mgmt status <wl/bl/pf>     # 打印白名单/黑名单/端口转发规则
-nft-mgmt init                   # 初始化 nftables 结构
-nft-mgmt save                   # 保存规则表
-nft-mgmt load                   # 加载规则表
+nft-mgmt init                  # 初始化 nftables 结构
+nft-mgmt save                  # 保存规则表
+nft-mgmt load                  # 加载规则表
 ```
