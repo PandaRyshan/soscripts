@@ -991,6 +991,59 @@ apply_forward_from_csv() {
     done < "$FORWARD_REG"
 }
 
+# UDP 入站限制：off 丢弃所有入站 UDP，on 不限制
+udp_block_enable() {
+    require_root_or_sudo
+    ensure_struct
+    # 先清理任何已存在的规则，保证幂等
+    udp_block_disable || true
+    local has_input has_prerouting
+    has_input=$($SUDO_CMD nft list chain inet filter input 2>/dev/null | grep -E 'meta l4proto udp .* drop' || true)
+    has_prerouting=$($SUDO_CMD nft list chain inet filter prerouting 2>/dev/null | grep -E 'fib daddr type local .* meta l4proto udp .* drop' || true)
+    if [[ -n "$has_input" && -n "$has_prerouting" ]]; then
+        log "入站 UDP 已处于丢弃状态（含 Docker 端口转发拦截）"
+        return 0
+    fi
+    # INPUT 链：优先插入到链首（在白名单跳转前），失败回退 add
+    [[ -n "$has_input" ]] || {
+        $SUDO_CMD nft insert rule inet filter input meta l4proto udp drop comment "udp-block" >/dev/null 2>&1 || \
+        $SUDO_CMD nft add rule inet filter input meta l4proto udp drop comment "udp-block" >/dev/null 2>&1 || true
+    }
+    # PREROUTING 链：在 DNAT 之前拦截本机目的的 UDP（优先于 Docker 规则）
+    [[ -n "$has_prerouting" ]] || {
+        $SUDO_CMD nft insert rule inet filter prerouting fib daddr type local meta l4proto udp drop comment "udp-block" >/dev/null 2>&1 || \
+        $SUDO_CMD nft add rule inet filter prerouting fib daddr type local meta l4proto udp drop comment "udp-block" >/dev/null 2>&1 || true
+    }
+    log "已开启入站 UDP 丢弃（含 Docker 端口转发，udp off）"
+}
+
+udp_block_disable() {
+    require_root_or_sudo
+    ensure_struct
+    local out handles removed=0
+    # INPUT 链
+    out=$($SUDO_CMD nft -a list chain inet filter input 2>/dev/null || true)
+    handles=$(echo "$out" | awk '/(meta l4proto udp).*drop/ && /handle/ {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+    while read -r h; do
+        [[ -n "$h" ]] || continue
+        $SUDO_CMD nft delete rule inet filter input handle "$h" >/dev/null 2>&1 || true
+        removed=1
+    done <<< "$handles"
+    # PREROUTING 链（本机目的拦截）
+    out=$($SUDO_CMD nft -a list chain inet filter prerouting 2>/dev/null || true)
+    handles=$(echo "$out" | awk '/fib daddr type local/ && /(meta l4proto udp).*drop/ && /handle/ {for(i=1;i<=NF;i++){if($i=="handle"){print $(i+1)}}}')
+    while read -r h; do
+        [[ -n "$h" ]] || continue
+        $SUDO_CMD nft delete rule inet filter prerouting handle "$h" >/dev/null 2>&1 || true
+        removed=1
+    done <<< "$handles"
+    if [[ "$removed" -eq 1 ]]; then
+        log "已恢复入站 UDP（移除 Docker 端口转发拦截，udp on）"
+    else
+        log "未发现入站 UDP 丢弃规则（无需恢复）"
+    fi
+}
+
 usage() {
     cat <<EOF
 用法: $0 <子命令> [参数]
@@ -1005,6 +1058,7 @@ usage() {
     update [--proxy=URL]        从仓库拉取最新 nft-mgmt.sh 并写入目标路径
                                  - 支持代理：如 --proxy=socks5://10.10.10.1:7799
                                  - 环境变量覆盖：UPDATE_SRC_URL、TARGET_UPDATE_PATH
+    udp on|off                  控制入站 UDP：off 丢弃所有入站 UDP；on 不加限制
 
 端口转发（pf）与 masquerade（pfm）命令：
     pf                         进入端口转发管理菜单
@@ -1109,6 +1163,13 @@ main() {
         save) save_rules ;;
         load) load_rules ;;
         update) do_update_self "$@" ;;
+        udp)
+            case "${1:-}" in
+                off) udp_block_enable ;;
+                on)  udp_block_disable ;;
+                *) err "未知 udp 子命令"; usage; exit 1 ;;
+            esac
+            ;;
         pf)
             case "${1:-}" in
                 add)
