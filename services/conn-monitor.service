@@ -10,14 +10,15 @@ ExecStart=/usr/local/bin/conn-monitor
 Restart=always
 RestartSec=10
 StartLimitInterval=0
-Environment="MAIL_SERVER=smtp.yourmail.com"
+Environment="MAIL_SERVER="
 Environment="MAIL_PORT=587"
-Environment="MAIL_USERNAME=your_username"
-Environment="MAIL_PASSWORD=your_password"
+Environment="MAIL_USERNAME="
+Environment="MAIL_PASSWORD="
+Environment="MAIL_TO="
 
 # 日志配置
 SyslogIdentifier=conn-monitor
-ReadWritePaths=/var/log/conn-monitor
+ReadWritePaths=/var/log
 
 # 安全配置
 NoNewPrivileges=yes

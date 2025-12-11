@@ -56,12 +56,19 @@ MAIL_USERNAME="${MAIL_USERNAME:-}"
 MAIL_PASSWORD="${MAIL_PASSWORD:-}"
 MAIL_TO=(${MAIL_TO:-})
 
+SWAKS_TIMEOUT=${SWAKS_TIMEOUT:-12}
+CONNTRACK_TIMEOUT=${CONNTRACK_TIMEOUT:-5}
+CURL_TIMEOUT=${CURL_TIMEOUT:-5}
+CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-3}
+INSTALL_TIMEOUT=${INSTALL_TIMEOUT:-30}
+MAIL_TLS_MODE=${MAIL_TLS_MODE:-auto}
+
 # 全局邮件就绪标志：配置完整时为 true，否则为 false
 MAIL_READY=false
 
 # ==================== 监控配置 ====================
 INTERVAL=10
-THRESHOLD=2000
+THRESHOLD=1500
 COOLDOWN_PERIOD=300
 # 允许用户自定义填写一个 IP（比如内网 IP），否则自动获取当前公网 IPv4
 # 显式声明覆盖变量，默认为空，便于用户通过环境变量传入
@@ -72,7 +79,10 @@ if [[ -n "$LOCAL_IP_OVERRIDE" ]] && is_valid_ipv4 "$LOCAL_IP_OVERRIDE"; then
     LOCAL_IP="$LOCAL_IP_OVERRIDE"
     LOCAL_IP_SOURCE="override"
 else
-    LOCAL_IP="$(curl -s -4 ifconfig.me)"
+    LOCAL_IP="$(curl -s --max-time "$CURL_TIMEOUT" --connect-timeout "$CURL_CONNECT_TIMEOUT" -4 ifconfig.me || true)"
+    if [[ -z "$LOCAL_IP" ]]; then
+        LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); break}}}')"
+    fi
     LOCAL_IP_SOURCE="public"
 fi
 
@@ -84,7 +94,6 @@ mkdir -p "$LOG_DIR"
 
 # ==================== 依赖检测 ====================
 check_and_install_dependencies() {
-    # 仅在开启邮件发送时安装 swaks
     local bins=("conntrack")
     local pkgs=("conntrack")
 
@@ -96,11 +105,15 @@ check_and_install_dependencies() {
     for i in "${!bins[@]}"; do
         if ! command -v "${bins[$i]}" &>/dev/null; then
             echo "缺少依赖: ${bins[$i]}，正在尝试安装..."
-            apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y ${pkgs[$i]} >/dev/null 2>&1 || {
-                echo "安装 ${bins[$i]} 失败，请手动安装"; exit 1;
-            }
-            echo "${bins[$i]} 安装成功"
+            if command -v apt-get &>/dev/null && [[ "$EUID" -eq 0 ]]; then
+                timeout "${INSTALL_TIMEOUT}s" apt-get update -y >/dev/null 2>&1 || true
+                timeout "${INSTALL_TIMEOUT}s" apt-get install -y ${pkgs[$i]} >/dev/null 2>&1 || {
+                    echo "安装 ${bins[$i]} 失败，请手动安装"; exit 1;
+                }
+                echo "${bins[$i]} 安装成功"
+            else
+                echo "无法自动安装 ${bins[$i]}，请手动安装"; exit 1
+            fi
         fi
     done
 }
@@ -135,8 +148,20 @@ send_alert_email() {
     local total=$1
     local top_connections=$2
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    local subject="TCP连接数预警 - ${timestamp}"
-    local body="警告: TCP连接数已达到 ${total}，超过阈值 ${THRESHOLD}\n时间: ${timestamp}\n主机: $(hostname)\n\n源IP状态分布（Top5）：\n${top_connections}"
+    local subject_raw="TCP连接数预警 - ${timestamp}"
+    local subject_mime="=?UTF-8?B?$(printf '%s' "$subject_raw" | base64 -w 0)?="
+    local body_raw="警告: TCP连接数已达到 ${total}，超过阈值 ${THRESHOLD}\n时间: ${timestamp}\n主机: $(hostname)\n\n源IP状态分布（Top5）：\n${top_connections}"
+    local body_b64=$(printf "%b" "$body_raw" | base64 -w 0)
+
+    local tls_opt
+    case "$MAIL_TLS_MODE" in
+        auto)
+            if [[ "$MAIL_PORT" == "465" ]]; then tls_opt="--tls-on-connect"; else tls_opt="--tls"; fi ;;
+        starttls) tls_opt="--tls" ;;
+        ssl) tls_opt="--tls-on-connect" ;;
+        none) tls_opt="" ;;
+        *) tls_opt="--tls" ;;
+    esac
 
     if [[ "$MAIL_READY" != true ]]; then
         echo "提示: 邮件配置不完整，跳过邮件发送"
@@ -149,7 +174,13 @@ send_alert_email() {
         swaks --to "$recipient" --from "$MAIL_USERNAME" \
               --server "$MAIL_SERVER" --port "$MAIL_PORT" \
               --auth-user "$MAIL_USERNAME" --auth-password "$MAIL_PASSWORD" \
-              --tls --h-Subject "$subject" --body "$body" --quiet
+              ${tls_opt} \
+              --timeout "$SWAKS_TIMEOUT" \
+              --header "MIME-Version: 1.0" \
+              --header "Content-Type: text/plain; charset=UTF-8" \
+              --header "Content-Transfer-Encoding: base64" \
+              --header "Subject: $subject_mime" \
+              --body "$body_b64" --silent
 
         if [ $? -eq 0 ]; then
             echo "邮件成功发送到: $recipient"
@@ -172,7 +203,7 @@ can_send_alert() {
 # ==================== 获取连接统计 ====================
 get_connection_stats() {
     local connections
-    connections=$(conntrack -L 2>/dev/null | grep -E "tcp" | grep -v "CONNTRACK" || true)
+    connections=$(timeout "${CONNTRACK_TIMEOUT}s" conntrack -L -d ${LOCAL_IP} 2>/dev/null | grep -E "tcp" | grep -v "CONNTRACK" || true)
 
     if [ -z "$connections" ]; then
         echo "0"
@@ -235,6 +266,58 @@ get_connection_stats() {
 
     echo "$total"
     echo "$result"
+}
+
+kill_timewait() {
+    local out4 out6 d4 d6 total
+    out4=$(timeout "${CONNTRACK_TIMEOUT}s" conntrack -D -p tcp --state TIME_WAIT 2>/dev/null || true)
+    d4=$(echo "$out4" | sed -n 's/.*: \([0-9][0-9]*\) flow entries have been deleted.*/\1/p')
+    out6=$(timeout "${CONNTRACK_TIMEOUT}s" conntrack -D -f ipv6 -p tcp --state TIME_WAIT 2>/dev/null || true)
+    d6=$(echo "$out6" | sed -n 's/.*: \([0-9][0-9]*\) flow entries have been deleted.*/\1/p')
+    total=$(( ${d4:-0} + ${d6:-0} ))
+    echo "已删除 TIME_WAIT TCP 连接: ${total}"
+}
+
+kill_top_connections() {
+    local list topip
+    list=$(timeout "${CONNTRACK_TIMEOUT}s" conntrack -L -d ${LOCAL_IP} 2>/dev/null || true)
+    if [[ -z "$list" ]]; then
+        echo "未获取到连接表，可能需要 root 权限"
+        return 1
+    fi
+    topip=$(echo "$list" | awk -v lip="$LOCAL_IP" '
+    {
+        remote="";
+        for (i=1;i<=NF;i++) {
+            if ($i ~ /^src=/) {
+                remote=substr($i,5);
+            } else if ($i == "dst=" lip) {
+                if (remote!="") {
+                    tot[remote]++;
+                }
+                break;
+            }
+        }
+    }
+    END {
+        best=""; bestv=0;
+        for (ip in tot) {
+            if (tot[ip] > bestv) { bestv=tot[ip]; best=ip; }
+        }
+        if (best != "") print best;
+    }')
+    if [[ -z "$topip" ]]; then
+        echo "未找到连接最多的源IP"
+        return 1
+    fi
+    echo "删除源IP: ${topip} 的 TCP 连接"
+    local out4 out6 d4 d6 total
+    out4=$(timeout "${CONNTRACK_TIMEOUT}s" conntrack -D -p tcp -s "$topip" 2>/dev/null || true)
+    d4=$(echo "$out4" | sed -n 's/.*: \([0-9][0-9]*\) flow entries have been deleted.*/\1/p')
+    out6=$(timeout "${CONNTRACK_TIMEOUT}s" conntrack -D -f ipv6 -p tcp -s "$topip" 2>/dev/null || true)
+    d6=$(echo "$out6" | sed -n 's/.*: \([0-9][0-9]*\) flow entries have been deleted.*/\1/p')
+    total=$(( ${d4:-0} + ${d6:-0} ))
+    echo "已删除连接数: ${total}"
 }
 
 # ==================== 颜色选择函数 ====================
@@ -305,7 +388,8 @@ format_output() {
 }
 
 # ==================== 主逻辑 ====================
-main() {
+main()
+{
     check_config_vars
     check_and_install_dependencies
 
@@ -374,4 +458,14 @@ main() {
     done
 }
 
-main
+case "${1:-}" in
+    -kw|--kill-timewait)
+        kill_timewait
+        ;;
+    -kt|--kill-top)
+        kill_top_connections
+        ;;
+    *)
+        main
+        ;;
+esac
