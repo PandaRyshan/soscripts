@@ -1,0 +1,14 @@
+[Unit]
+Description=Bandwidth Limit Service (tc)
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tc_limit --on 170
+ExecStop=/usr/local/bin/tc_limit --off
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
