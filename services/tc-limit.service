@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/tc_limit --on 170
+ExecStart=/usr/local/bin/tc_limit --on 160
 ExecStop=/usr/local/bin/tc_limit --off
 StandardOutput=journal
 
