@@ -1,177 +1,584 @@
 #!/usr/bin/env bash
+# tc_limit — Smart bandwidth limit daemon
+# Monitors network traffic via a sliding window and proactively adjusts
+# tc limits to avoid triggering cloud provider penalty policies.
+#
+# Usage:  tc_limit --on [OPTS]
+#         tc_limit --off
+#         tc_limit --status
+#         tc_limit -h
 
 set -euo pipefail
 
-DEFAULT_RATE=150
-DEFAULT_BURST=16
+# ── Defaults ──────────────────────────────────────────────────────────
+HIGHER_LIMIT=150        # Mbps — normal operating limit
+LOWER_LIMIT=110         # Mbps — limit after sustained high usage
+THRESHOLD=120           # Mbps — bandwidth alert line
+WINDOW=15               # min  — sliding window size
+INTERVAL=10             # sec  — sampling interval
+COOLDOWN=5              # min  — cooldown after entering LIMITED
+IFACE=""                # auto-detected unless overridden
+DRY_RUN=false           # true → skip tc commands, log only
+BURST_KBIT=16           # kbit — token bucket burst size
+
+# ── Derived constants (set after parsing) ─────────────────────────────
+BUF_SIZE=0
+THRESHOLD_BPS=0         # bytes/sec
+WINDOW_SEC=0
+COOLDOWN_SEC=0
+
+# ── Runtime globals ───────────────────────────────────────────────────
+STATE="NORMAL"
+COOLDOWN_START=0
 IFB="ifb0"
+STATE_FILE="/run/tc_limit.state"
+PID_FILE="/run/tc_limit.pid"
+LOCK_FD=""
+LOG_TAG="tc_limit"
+
+declare -a RING_BUF=()
+BUF_IDX=0
+BUF_FILLED=0            # number of valid slots written so far
+PREV_BYTES=0            # last raw counter reading
+SAMPLE_N=0              # sample counter for periodic summary
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2; }
 
 get_iface() {
     ip route get 1.1.1.1 2>/dev/null | awk '
-        {
-            for(i=1;i<=NF;i++){
-                if($i=="dev"){
-                    print $(i+1)
-                    exit
-                }
-            }
-        }'
+        { for(i=1;i<=NF;i++) if($i=="dev") { print $(i+1); exit } }'
 }
 
-IFACE="$(get_iface)"
+file_exists() { [[ -f "$1" ]]; }
+proc_running() { [[ -d "/proc/$1" ]]; }
 
-usage() {
-cat <<EOF
-tc_limit - Linux ingress/egress bandwidth limiter
+mbit_to_bytes_per_sec() { echo $(( $1 * 125000 )); }   # Mbps → B/s
 
-Usage:
-  tc_limit --on [RATE] [BURST]
-  tc_limit --off
-  tc_limit --status
-  tc_limit -h
-  tc_limit --help
+# ── Lock ──────────────────────────────────────────────────────────────
 
-Options:
+acquire_lock() {
+    exec {LOCK_FD}>"$PID_FILE"
+    if ! flock -n "$LOCK_FD"; then
+        echo "ERROR: Another instance is already running (lock on $PID_FILE)" >&2
+        exit 1
+    fi
+    echo $$ > "$PID_FILE"
+}
 
-  --on [RATE]
-      Enable bandwidth limiting.
+release_lock() {
+    [[ -n "$LOCK_FD" ]] && flock -u "$LOCK_FD" 2>/dev/null || true
+    rm -f "$PID_FILE"
+}
 
-      RATE unit: Mbps (default 150Mbps)
-      BURST unit: kbit (default 16kbit)
+# ── Persistence ───────────────────────────────────────────────────────
 
-      Example:
-          tc_limit --on
-          tc_limit --on 150
-          tc_limit --on 100
+save_state() {
+    local tmp="${STATE_FILE}.tmp"
+    {
+        echo "STATE=$STATE"
+        [[ "$STATE" == "LIMITED" ]] && echo "COOLDOWN_START=$COOLDOWN_START"
+    } > "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
 
-      Default:
-          ${DEFAULT_RATE} Mbps
-          ${DEFAULT_BURST} kbps
+load_state() {
+    if [[ -r "$STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$STATE_FILE" 2>/dev/null || true
+        if [[ "${STATE:-}" == "LIMITED" && -n "${COOLDOWN_START:-}" ]]; then
+            local now elapsed remain
+            now=$(date +%s)
+            elapsed=$(( now - COOLDOWN_START ))
+            remain=$(( COOLDOWN_SEC - elapsed ))
+            if (( remain > 0 )); then
+                STATE="LIMITED"
+                log "Resumed LIMITED state (${remain}s cooldown remaining)"
+            else
+                STATE="NORMAL"
+                COOLDOWN_START=0
+                log "Stored cooldown expired, starting NORMAL"
+            fi
+        else
+            STATE="NORMAL"
+            COOLDOWN_START=0
+        fi
+    fi
+}
 
-  --off
-      Disable all limits.
+# ── tc management ─────────────────────────────────────────────────────
 
-  --status
-      Show current status.
+tc_init() {
+    local rate="$1"
+    log "Initialising tc: ${rate} Mbps on ${IFACE}"
 
-  -h, --help
-      Show this help.
+    if $DRY_RUN; then
+        log "[dry-run] Would set up tc: ${rate} Mbps egress+ingress via IFB"
+        return
+    fi
 
-Examples:
+    # Clean slate
+    tc qdisc del dev "$IFACE" root     2>/dev/null || true
+    tc qdisc del dev "$IFACE" ingress  2>/dev/null || true
+    tc qdisc del dev "$IFB"   root     2>/dev/null || true
+    ip link set "$IFB" down 2>/dev/null || true
 
-  tc_limit --on
-  tc_limit --on 150
-  tc_limit --off
-  tc_limit --status
+    modprobe ifb numifbs=1 2>/dev/null || true
+    ip link add "$IFB" type ifb 2>/dev/null || true
+    ip link set "$IFB" up 2>/dev/null || true
 
-EOF
+    # Egress HTB
+    if ! tc qdisc add dev "$IFACE" root handle 1: htb default 10 2>/dev/null; then
+        log "FATAL: Cannot add HTB root qdisc on ${IFACE} (existing: $(tc qdisc show dev "$IFACE" 2>/dev/null | head -1))"
+        exit 1
+    fi
+    tc class add dev "$IFACE" parent 1: classid 1:10 \
+        htb rate "${rate}mbit" ceil "${rate}mbit" \
+        burst "${BURST_KBIT}kbit" cburst "${BURST_KBIT}kbit" || {
+        log "FATAL: Cannot add HTB class on ${IFACE}"
+        exit 1
+    }
+
+    # Ingress → IFB
+    tc qdisc add dev "$IFACE" handle ffff: ingress 2>/dev/null || true
+    tc filter add dev "$IFACE" parent ffff: protocol all \
+        u32 match u32 0 0 action mirred egress redirect dev "$IFB" 2>/dev/null || {
+        log "FATAL: Cannot add ingress redirect to ${IFB}"
+        exit 1
+    }
+
+    # IFB limit
+    tc qdisc add dev "$IFB" root handle 2: htb default 20 2>/dev/null || {
+        log "FATAL: Cannot add HTB root qdisc on ${IFB}"
+        exit 1
+    }
+    tc class add dev "$IFB" parent 2: classid 2:20 \
+        htb rate "${rate}mbit" ceil "${rate}mbit" \
+        burst "${BURST_KBIT}kbit" cburst "${BURST_KBIT}kbit" || {
+        log "FATAL: Cannot add HTB class on ${IFB}"
+        exit 1
+    }
+
+    log "tc initialised: ${rate} Mbps (egress + ingress)"
+}
+
+tc_change_rate() {
+    local rate="$1"
+    if $DRY_RUN; then
+        log "[dry-run] Would switch tc to ${rate} Mbps"
+        return
+    fi
+    tc class change dev "$IFACE" parent 1: classid 1:10 \
+        htb rate "${rate}mbit" ceil "${rate}mbit" \
+        burst "${BURST_KBIT}kbit" cburst "${BURST_KBIT}kbit" 2>/dev/null || true
+
+    tc class change dev "$IFB" parent 2: classid 2:20 \
+        htb rate "${rate}mbit" ceil "${rate}mbit" \
+        burst "${BURST_KBIT}kbit" cburst "${BURST_KBIT}kbit" 2>/dev/null || true
 }
 
 cleanup() {
-    tc qdisc del dev "$IFACE" root 2>/dev/null || true
-    tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
-
-    tc qdisc del dev "$IFB" root 2>/dev/null || true
-
+    log "Cleaning up tc rules and IFB device…"
+    tc qdisc del dev "$IFACE" root     2>/dev/null || true
+    tc qdisc del dev "$IFACE" ingress  2>/dev/null || true
+    tc qdisc del dev "$IFB"   root     2>/dev/null || true
     ip link set "$IFB" down 2>/dev/null || true
-
-    echo "[OK] Bandwidth limit disabled"
+    release_lock
+    rm -f "$STATE_FILE"
+    log "Cleanup complete. Bandwidth limits removed."
 }
 
-enable_limit() {
-    local RATE="$1"
-    local BURST="$2"
+# ── Signal Handlers ───────────────────────────────────────────────────
 
-    echo "[INFO] Interface : $IFACE"
-    echo "[INFO] Rate      : ${RATE} Mbps"
-    echo "[INFO] BURST     : ${BURST} kbps"
+on_signal() { cleanup; exit 0; }
 
-    cleanup >/dev/null 2>&1 || true
-
-    modprobe ifb numifbs=1
-
-    ip link add "$IFB" type ifb 2>/dev/null || true
-    ip link set "$IFB" up
-
-    #
-    # Egress
-    #
-    tc qdisc add dev "$IFACE" root handle 1: htb default 10
-
-    tc class add dev "$IFACE" parent 1: classid 1:10 \
-        htb rate "${RATE}mbit" ceil "${RATE}mbit" burst "${BURST}kbit" cburst "${BURST}kbit"
-
-    #
-    # Ingress -> IFB
-    #
-    tc qdisc add dev "$IFACE" handle ffff: ingress
-
-    tc filter add dev "$IFACE" parent ffff: \
-        protocol all u32 match u32 0 0 \
-        action mirred egress redirect dev "$IFB"
-
-    #
-    # IFB limit
-    #
-    tc qdisc add dev "$IFB" root handle 2: htb default 20
-
-    tc class add dev "$IFB" parent 2: classid 2:20 \
-        htb rate "${RATE}mbit" ceil "${RATE}mbit" burst "${BURST}kbit" cburst "${BURST}kbit"
-
-    echo
-    echo "[OK] Bandwidth limit enabled"
-    echo "     Egress : ${RATE} Mbps"
-    echo "     Ingress: ${RATE} Mbps"
+on_usr1() {
+    local now rate avg_mbps line
+    now=$(date +%s)
+    rate=$(current_rate)
+    line="[STATUS] State=$STATE  Rate=${rate}Mbps  Samples=$SAMPLE_N"
+    if [[ "$STATE" == "LIMITED" ]]; then
+        local remain=$(( COOLDOWN_SEC - (now - COOLDOWN_START) ))
+        (( remain < 0 )) && remain=0
+        line+="  Cooldown=${remain}s"
+    fi
+    if (( BUF_FILLED > 0 )); then
+        avg_mbps=$(ring_buf_avg_mbps)
+        line+="  WindowAvg=$(printf "%.1f" "$avg_mbps")Mbps"
+    fi
+    log "$line"
 }
 
-status() {
-    echo
-    echo "========== Interface =========="
-    echo "$IFACE"
+# ── Help ──────────────────────────────────────────────────────────────
 
-    echo
-    echo "========== Egress =========="
-    tc qdisc show dev "$IFACE" || true
+usage() {
+    cat <<EOF
+tc_limit — Smart bandwidth limit daemon
 
-    echo
-    echo "========== Ingress(IFB) =========="
-    tc qdisc show dev "$IFB" || true
+Monitors network traffic via a sliding window and proactively adjusts
+bandwidth limits to avoid triggering cloud provider penalty policies.
 
-    echo
-    echo "========== Statistics =========="
-    tc -s class show dev "$IFACE" 2>/dev/null || true
+Usage:
+  tc_limit --on [OPTIONS]    Start daemon (defaults: -H 150 -L 110 -T 120 -W 20 -I 10 -C 5)
+  tc_limit --off             Stop daemon and remove all limits
+  tc_limit --status          Show running status
+  tc_limit -h                Show this help
 
-    echo
-    tc -s class show dev "$IFB" 2>/dev/null || true
+Options:
+  -H, --higher-limit RATE   Normal operating bandwidth (Mbps, default 150)
+  -L, --lower-limit  RATE   Bandwidth after sustained high usage (Mbps, default 110)
+  -T, --threshold     RATE  Alert threshold (Mbps, default 120)
+  -W, --window        MINS  Sliding window size (minutes, default 20)
+  -I, --interval      SECS  Sampling interval (seconds, default 10)
+  -C, --cooldown      MINS  Cooldown period after entering LIMITED (minutes, default 5)
+  --iface              DEV  Network interface (auto-detected if omitted)
+  --dry-run                  Monitor only, do not modify tc rules
+  --log-file           PATH  Write logs to file instead of stderr
+
+State machine:
+  NORMAL  (tc = higher-limit)  — sliding window avg > threshold → LIMITED
+  LIMITED (tc = lower-limit)   — cooldown expires → NORMAL
+
+Examples:
+  tc_limit --on                          # defaults
+  tc_limit --on -H 200 -L 100 -T 150     # custom limits
+  tc_limit --on --dry-run                # observe, don't enforce
+EOF
 }
+
+# ── Ring Buffer ───────────────────────────────────────────────────────
+
+ring_buf_init() {
+    local i
+    for (( i = 0; i < BUF_SIZE; i++ )); do
+        RING_BUF[i]=0
+    done
+    BUF_IDX=0
+    BUF_FILLED=0
+}
+
+ring_buf_push() {
+    local delta="$1"
+    RING_BUF[BUF_IDX]=$delta
+    BUF_IDX=$(( (BUF_IDX + 1) % BUF_SIZE ))
+    (( BUF_FILLED < BUF_SIZE )) && (( BUF_FILLED++ ))
+}
+
+ring_buf_sum() {
+    local i sum=0
+    for (( i = 0; i < BUF_SIZE; i++ )); do
+        sum=$(( sum + RING_BUF[i] ))
+    done
+    echo $sum
+}
+
+ring_buf_clear() {
+    ring_buf_init
+}
+
+ring_buf_is_full() { (( BUF_FILLED >= BUF_SIZE )); }
+
+ring_buf_avg_mbps() {
+    # Average bandwidth in Mbps over the window (or filled portion)
+    local count sum avg_bps
+    if (( BUF_FILLED == 0 )); then
+        echo 0
+        return
+    fi
+    count=$BUF_FILLED
+    sum=$(ring_buf_sum)
+    # avg over filled slots: bytes/sample / (interval seconds)
+    avg_bps=$(( sum / (count * INTERVAL) ))
+    # bps → Mbps with one decimal
+    awk "BEGIN { printf \"%.1f\", $avg_bps / 125000 }"
+}
+
+# ── /sys counters ─────────────────────────────────────────────────────
+
+read_bytes() {
+    local tx rx
+    tx=$(cat "/sys/class/net/${IFACE}/statistics/tx_bytes" 2>/dev/null) || return 1
+    rx=$(cat "/sys/class/net/${IFACE}/statistics/rx_bytes" 2>/dev/null) || return 1
+    echo $(( tx + rx ))
+}
+
+# ── State queries ─────────────────────────────────────────────────────
+
+current_rate() {
+    if [[ "$STATE" == "LIMITED" ]]; then
+        echo "$LOWER_LIMIT"
+    else
+        echo "$HIGHER_LIMIT"
+    fi
+}
+
+# ── Daemon loop ───────────────────────────────────────────────────────
+
+daemon() {
+    log "Daemon started: higher=${HIGHER_LIMIT}M lower=${LOWER_LIMIT}M threshold=${THRESHOLD}M window=${WINDOW}m interval=${INTERVAL}s cooldown=${COOLDOWN}m"
+    log "Interface: ${IFACE}"
+
+    # Initialise tc with current state's rate
+    tc_init "$(current_rate)"
+
+    # Seed the byte counter
+    PREV_BYTES=$(read_bytes) || { log "FATAL: Cannot read /sys counters for ${IFACE}"; exit 1; }
+
+    local consecutive_fail=0
+
+    while true; do
+        sleep "$INTERVAL"
+
+        # ── Sample ───────────────────────────────────────────────────
+        local cur_bytes delta
+        if ! cur_bytes=$(read_bytes); then
+            consecutive_fail=$(( consecutive_fail + 1 ))
+            log "WARN: Failed to read /sys counters (${consecutive_fail}/3)"
+            if (( consecutive_fail >= 3 )); then
+                log "FATAL: 3 consecutive reads failed, exiting"
+                cleanup
+                exit 1
+            fi
+            continue
+        fi
+        consecutive_fail=0
+
+        delta=$(( cur_bytes - PREV_BYTES ))
+        PREV_BYTES=$cur_bytes
+
+        # Guard: counter wrap (virtually impossible with 64-bit, but be safe)
+        if (( delta < 0 )); then
+            log "WARN: Counter wrap detected, resetting buffer"
+            ring_buf_clear
+            PREV_BYTES=$cur_bytes
+            continue
+        fi
+
+        # ── Push to ring buffer ──────────────────────────────────────
+        ring_buf_push "$delta"
+        SAMPLE_N=$(( SAMPLE_N + 1 ))
+
+        # ── Decision ─────────────────────────────────────────────────
+        local now
+        now=$(date +%s)
+
+        case "$STATE" in
+            NORMAL)
+                # Only evaluate once buffer is full
+                if ring_buf_is_full; then
+                    local window_sum threshold_bytes
+                    window_sum=$(ring_buf_sum)
+                    threshold_bytes=$(( THRESHOLD_BPS * WINDOW_SEC ))
+
+                    if (( window_sum > threshold_bytes )); then
+                        STATE="LIMITED"
+                        COOLDOWN_START=$now
+                        tc_change_rate "$LOWER_LIMIT"
+                        save_state
+                        local avg_mbps
+                        avg_mbps=$(ring_buf_avg_mbps)
+                        log "→ LIMITED (window avg ${avg_mbps}Mbps > ${THRESHOLD}M threshold, cooldown ${COOLDOWN_SEC}s)"
+                    fi
+                fi
+                ;;
+
+            LIMITED)
+                local elapsed=$(( now - COOLDOWN_START ))
+                if (( elapsed >= COOLDOWN_SEC )); then
+                    STATE="NORMAL"
+                    COOLDOWN_START=0
+                    ring_buf_clear
+                    tc_change_rate "$HIGHER_LIMIT"
+                    save_state
+                    log "→ NORMAL (cooldown complete, rate restored to ${HIGHER_LIMIT}M)"
+                fi
+                ;;
+        esac
+
+        # ── Periodic summary (every 60s) ─────────────────────────────
+        if (( SAMPLE_N > 0 && SAMPLE_N % (60 / INTERVAL) == 0 )); then
+            local avg
+            avg=$(ring_buf_avg_mbps)
+            log "summary: state=${STATE} rate=$(current_rate)M window_avg=${avg}Mbps samples=${BUF_FILLED}/${BUF_SIZE}"
+        fi
+    done
+}
+
+# ── Status command (CLI) ──────────────────────────────────────────────
+
+show_status() {
+    if [[ -r "$STATE_FILE" ]]; then
+        local s state cooldown_start
+        # shellcheck source=/dev/null
+        source "$STATE_FILE" 2>/dev/null || true
+        state="${STATE:-UNKNOWN}"
+        cooldown_start="${COOLDOWN_START:-0}"
+
+        echo "Daemon: running"
+        echo "State:  ${state}"
+
+        local rate
+        if [[ "$state" == "LIMITED" ]]; then
+            rate=$LOWER_LIMIT
+        else
+            rate=$HIGHER_LIMIT
+        fi
+        echo "TC:     ${rate} Mbps"
+
+        if [[ "$state" == "LIMITED" && "$cooldown_start" -gt 0 ]]; then
+            local now remain
+            now=$(date +%s)
+            remain=$(( COOLDOWN_SEC - (now - cooldown_start) ))
+            (( remain < 0 )) && remain=0
+            echo "Recover: ${remain}s remaining"
+        fi
+
+        if [[ -r "$PID_FILE" ]]; then
+            local pid
+            pid=$(<"$PID_FILE")
+            if proc_running "$pid"; then
+                echo "PID:    ${pid}"
+            fi
+        fi
+    else
+        echo "Daemon: not running"
+    fi
+
+    # Always show current tc status
+    echo
+    echo "── tc egress ──"
+    tc -s class show dev "$IFACE" 2>/dev/null || echo "(no rules)"
+    echo
+    echo "── tc ingress (IFB) ──"
+    tc -s class show dev "$IFB" 2>/dev/null || echo "(no rules)"
+}
+
+# ── Stop command (CLI) ────────────────────────────────────────────────
+
+stop_daemon() {
+    if [[ -r "$PID_FILE" ]]; then
+        local pid
+        pid=$(<"$PID_FILE")
+        if proc_running "$pid"; then
+            log "Sending SIGTERM to daemon (PID ${pid})…"
+            kill "$pid" 2>/dev/null || true
+            # Wait up to 5s for graceful exit
+            local i
+            for (( i = 0; i < 50; i++ )); do
+                proc_running "$pid" || break
+                sleep 0.1
+            done
+            proc_running "$pid" && log "WARN: Daemon did not exit, forcing cleanup"
+        fi
+    fi
+    # Always run cleanup regardless of daemon state
+    cleanup
+}
+
+# ── Parameter Parsing ─────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --higher-limit|-H)
+                HIGHER_LIMIT="$2"; shift 2 ;;
+            --lower-limit|-L)
+                LOWER_LIMIT="$2"; shift 2 ;;
+            --threshold|-T)
+                THRESHOLD="$2"; shift 2 ;;
+            --window|-W)
+                WINDOW="$2"; shift 2 ;;
+            --interval|-I)
+                INTERVAL="$2"; shift 2 ;;
+            --cooldown|-C)
+                COOLDOWN="$2"; shift 2 ;;
+            --iface)
+                IFACE="$2"; shift 2 ;;
+            --dry-run)
+                DRY_RUN=true; shift ;;
+            --log-file)
+                LOG_FILE="$2"; shift 2 ;;
+            *)
+                echo "Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+validate_args() {
+    local err=0
+    for v in HIGHER_LIMIT LOWER_LIMIT THRESHOLD WINDOW INTERVAL COOLDOWN; do
+        if ! [[ "${!v}" =~ ^[0-9]+$ ]] || (( ${!v} <= 0 )); then
+            echo "ERROR: ${v}=${!v} is not a positive integer" >&2
+            err=1
+        fi
+    done
+
+    if (( HIGHER_LIMIT <= THRESHOLD )); then
+        echo "ERROR: higher-limit (${HIGHER_LIMIT}) must be > threshold (${THRESHOLD})" >&2
+        err=1
+    fi
+    if (( THRESHOLD <= LOWER_LIMIT )); then
+        echo "ERROR: threshold (${THRESHOLD}) must be > lower-limit (${LOWER_LIMIT})" >&2
+        err=1
+    fi
+    if (( INTERVAL < 1 )); then
+        echo "ERROR: interval must be >= 1" >&2
+        err=1
+    fi
+
+    if (( err )); then exit 1; fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────
 
 main() {
-
     case "${1:-}" in
-
         --on)
-            RATE="${2:-$DEFAULT_RATE}"
-            BURST="${3:-$DEFAULT_BURST}"
+            shift
+            parse_args "$@"
+            validate_args
 
-            if ! [[ "$RATE" =~ ^[0-9]+$ ]]; then
-                echo "Invalid rate: $RATE"
+            # Derived constants
+            BUF_SIZE=$(( WINDOW * 60 / INTERVAL ))
+            THRESHOLD_BPS=$(mbit_to_bytes_per_sec "$THRESHOLD")
+            WINDOW_SEC=$(( WINDOW * 60 ))
+            COOLDOWN_SEC=$(( COOLDOWN * 60 ))
+
+            # Interface
+            [[ -z "$IFACE" ]] && IFACE=$(get_iface)
+            if [[ -z "$IFACE" ]]; then
+                echo "ERROR: Cannot determine network interface" >&2
                 exit 1
             fi
 
-            if ! [[ "$BURST" =~ ^[0-9]+$ ]]; then
-                echo "Invalid burst: $BURST"
-                exit 1
+            # Lock & persistence
+            acquire_lock
+            load_state
+
+            # Redirect logs if requested
+            if [[ -n "${LOG_FILE:-}" ]]; then
+                exec 2>>"$LOG_FILE"
             fi
 
-            enable_limit "$RATE" "$BURST"
+            # Signals
+            trap on_signal SIGTERM SIGINT
+            trap on_usr1  SIGUSR1
+
+            # Run
+            daemon
             ;;
 
         --off)
-            cleanup
+            stop_daemon
             ;;
 
         --status)
-            status
+            [[ -z "$IFACE" ]] && IFACE=$(get_iface)
+            show_status
             ;;
 
         -h|--help)
