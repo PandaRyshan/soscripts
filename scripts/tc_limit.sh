@@ -52,7 +52,9 @@ get_iface() {
 }
 
 file_exists() { [[ -f "$1" ]]; }
-proc_running() { [[ -d "/proc/$1" ]]; }
+proc_running() {
+    [[ -d "/proc/$1" ]] && grep -qF "tc_limit" "/proc/$1/cmdline" 2>/dev/null
+}
 
 mbit_to_bytes_per_sec() { echo $(( $1 * 125000 )); }   # Mbps → B/s
 
@@ -75,10 +77,15 @@ release_lock() {
 # ── Persistence ───────────────────────────────────────────────────────
 
 save_state() {
+    local window_avg="${1:-}"
     local tmp="${STATE_FILE}.tmp"
     {
         echo "STATE=$STATE"
+        echo "RATE=$(current_rate)"
+        echo "THRESHOLD=$THRESHOLD"
+        echo "COOLDOWN_SEC=$COOLDOWN_SEC"
         [[ "$STATE" == "LIMITED" ]] && echo "COOLDOWN_START=$COOLDOWN_START"
+        [[ -n "$window_avg" ]] && echo "WINDOW_AVG=$window_avg"
     } > "$tmp"
     mv "$tmp" "$STATE_FILE"
 }
@@ -376,9 +383,9 @@ daemon() {
                         STATE="LIMITED"
                         COOLDOWN_START=$now
                         tc_change_rate "$LOWER_LIMIT"
-                        save_state
                         local avg_mbps
                         avg_mbps=$(ring_buf_avg_mbps)
+                        save_state "$avg_mbps"
                         log "→ LIMITED (window avg ${avg_mbps}Mbps > ${THRESHOLD}M threshold, cooldown ${COOLDOWN_SEC}s)"
                     fi
                 fi
@@ -401,6 +408,7 @@ daemon() {
         if (( SAMPLE_N > 0 && SAMPLE_N % (60 / INTERVAL) == 0 )); then
             local avg
             avg=$(ring_buf_avg_mbps)
+            save_state "$avg"
             log "summary: state=${STATE} rate=$(current_rate)M window_avg=${avg}Mbps samples=${BUF_FILLED}/${BUF_SIZE}"
         fi
     done
@@ -410,36 +418,36 @@ daemon() {
 
 show_status() {
     if [[ -r "$STATE_FILE" ]]; then
-        local s state cooldown_start
+        local state rate threshold cooldown cooldown_start window_avg pid
         # shellcheck source=/dev/null
         source "$STATE_FILE" 2>/dev/null || true
         state="${STATE:-UNKNOWN}"
+        rate="${RATE:--}"
+        threshold="${THRESHOLD:--}"
+        cooldown="${COOLDOWN_SEC:-0}"
         cooldown_start="${COOLDOWN_START:-0}"
+        window_avg="${WINDOW_AVG:--}"
 
         echo "Daemon: running"
-        echo "State:  ${state}"
-
-        local rate
-        if [[ "$state" == "LIMITED" ]]; then
-            rate=$LOWER_LIMIT
-        else
-            rate=$HIGHER_LIMIT
+        echo "State:    ${state}"
+        echo "Rate:     ${rate} Mbps"
+        echo "Threshold: ${threshold} Mbps"
+        if [[ "$window_avg" != "-" && -n "$window_avg" ]]; then
+            echo "Window:   ${window_avg} Mbps avg"
         fi
-        echo "TC:     ${rate} Mbps"
 
         if [[ "$state" == "LIMITED" && "$cooldown_start" -gt 0 ]]; then
             local now remain
             now=$(date +%s)
-            remain=$(( COOLDOWN_SEC - (now - cooldown_start) ))
+            remain=$(( cooldown - (now - cooldown_start) ))
             (( remain < 0 )) && { remain=0; :; }
-            echo "Recover: ${remain}s remaining"
+            echo "Recover:  ${remain}s remaining"
         fi
 
         if [[ -r "$PID_FILE" ]]; then
-            local pid
             pid=$(<"$PID_FILE")
             if proc_running "$pid"; then
-                echo "PID:    ${pid}"
+                echo "PID:      ${pid}"
             fi
         fi
     else
