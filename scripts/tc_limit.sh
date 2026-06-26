@@ -14,7 +14,7 @@ set -euo pipefail
 HIGHER_LIMIT=150        # Mbps — normal operating limit
 LOWER_LIMIT=110         # Mbps — limit after sustained high usage
 THRESHOLD=120           # Mbps — bandwidth alert line
-WINDOW=15               # min  — sliding window size
+WINDOW=19               # min  — sliding window size
 INTERVAL=10             # sec  — sampling interval
 COOLDOWN=5              # min  — cooldown after entering LIMITED
 IFACE=""                # auto-detected unless overridden
@@ -299,7 +299,7 @@ Options:
   -H, --higher-limit RATE   Normal operating bandwidth (Mbps, default 150)
   -L, --lower-limit  RATE   Bandwidth after sustained high usage (Mbps, default 110)
   -T, --threshold     RATE  Alert threshold (Mbps, default 120)
-  -W, --window        MINS  Sliding window size (minutes, default 20)
+  -W, --window        MINS  Sliding window size (minutes, default 19)
   -I, --interval      SECS  Sampling interval (seconds, default 10)
   -C, --cooldown      MINS  Cooldown period after entering LIMITED (minutes, default 5)
   -c, --config         PATH  Config file (default: /etc/tc_limit/tc_limit.conf)
