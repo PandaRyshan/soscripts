@@ -200,7 +200,7 @@ on_usr1() {
     line="[STATUS] State=$STATE  Rate=${rate}Mbps  Samples=$SAMPLE_N"
     if [[ "$STATE" == "LIMITED" ]]; then
         local remain=$(( COOLDOWN_SEC - (now - COOLDOWN_START) ))
-        (( remain < 0 )) && remain=0
+        (( remain < 0 )) && { remain=0; :; }
         line+="  Cooldown=${remain}s"
     fi
     if (( BUF_FILLED > 0 )); then
@@ -262,7 +262,8 @@ ring_buf_push() {
     local delta="$1"
     RING_BUF[BUF_IDX]=$delta
     BUF_IDX=$(( (BUF_IDX + 1) % BUF_SIZE ))
-    (( BUF_FILLED < BUF_SIZE )) && (( BUF_FILLED++ ))
+    (( BUF_FILLED < BUF_SIZE )) && (( BUF_FILLED += 1 ))
+    return 0
 }
 
 ring_buf_sum() {
@@ -430,7 +431,7 @@ show_status() {
             local now remain
             now=$(date +%s)
             remain=$(( COOLDOWN_SEC - (now - cooldown_start) ))
-            (( remain < 0 )) && remain=0
+            (( remain < 0 )) && { remain=0; :; }
             echo "Recover: ${remain}s remaining"
         fi
 
