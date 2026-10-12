@@ -84,8 +84,8 @@ install_yq() {
 #     templates/*.yaml
 #     hooks/*.yaml
 #
-# Merge order: global config → project config → global templates →
-#              project templates → global hooks → project hooks
+# Merge order (corrected): global config → global templates → global hooks →
+#                          project config → project templates → project hooks
 # ---------------------------------------------------------------------------
 
 bootstrap_global_config() {
@@ -190,23 +190,21 @@ _yq_merge_dir() {
 load_config() {
     bootstrap_global_config
 
-    # 1+2: global config.yaml + project config.yaml
+    # 1. Start with global config
     local merged
     merged=$(cat "$GLOBAL_CONFIG")
+
+    # 2. Merge global templates and hooks BEFORE project config
+    merged=$(_yq_merge_dir "$merged" "$GLOBAL_TEMPLATES")
+    merged=$(_yq_merge_dir "$merged" "$GLOBAL_HOOKS")
+
+    # 3. Merge project config.yaml (can override global templates/hooks)
     if [[ -f "${PROJECT_CONFIG}/config.yaml" ]]; then
         merged=$(_yq_merge_file "$merged" "${PROJECT_CONFIG}/config.yaml")
     fi
 
-    # 3: global templates
-    merged=$(_yq_merge_dir "$merged" "$GLOBAL_TEMPLATES")
-
-    # 4: project templates
+    # 4. Merge project templates and hooks (highest priority)
     merged=$(_yq_merge_dir "$merged" "${PROJECT_CONFIG}/templates")
-
-    # 5: global hooks
-    merged=$(_yq_merge_dir "$merged" "$GLOBAL_HOOKS")
-
-    # 6: project hooks
     merged=$(_yq_merge_dir "$merged" "${PROJECT_CONFIG}/hooks")
 
     echo "$merged"
@@ -302,6 +300,11 @@ create_workspace() {
     local window_count
     window_count=$(get_window_count "$template")
 
+    if [[ "$window_count" -lt 1 ]]; then
+        echo "ERROR: Template '$template' has no windows defined." >&2
+        exit 1
+    fi
+
     for ((w=0; w<window_count; w++)); do
         local wname pane_count
         wname=$(get_window_name "$template" "$w")
@@ -336,9 +339,15 @@ create_workspace() {
                 sz=$(get_pane_size "$template" "$w" "$p")
                 if [[ "$sz" -gt 0 ]]; then
                     if [[ "$split_dir" == "v" ]]; then
-                        tmux resize-pane -t "$previous_pane" -D "$sz" 2>/dev/null || true
+                        # Shrink previous pane (above) by moving its bottom edge up
+                        if ! tmux resize-pane -t "$previous_pane" -U "$sz" 2>/dev/null; then
+                            echo "WARN: Failed to resize pane $previous_pane by $sz cells" >&2
+                        fi
                     else
-                        tmux resize-pane -t "$previous_pane" -R "$sz" 2>/dev/null || true
+                        # Shrink previous pane (left) by moving its right edge left
+                        if ! tmux resize-pane -t "$previous_pane" -L "$sz" 2>/dev/null; then
+                            echo "WARN: Failed to resize pane $previous_pane by $sz cells" >&2
+                        fi
                     fi
                 fi
             fi
@@ -476,7 +485,7 @@ cmd_templates() {
         else
             printf "  %-20s  %s\n" "$name$marker" "(${pane_count} pane(s))"
         fi
-    done < <(yq -r '.templates | to_entries[] | [.key, (.value.description // ""), (.value.windows[0].panes | length)] | join("|")' <<<"$MERGED_CONFIG")
+    done < <(yq -r '.templates | to_entries[] | [.key, (.value.description // ""), ((.value.windows // []) | if length > 0 then .[0].panes | length else 0 end)] | join("|")' <<<"$MERGED_CONFIG")
 }
 
 cmd_help() {
