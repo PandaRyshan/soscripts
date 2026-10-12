@@ -110,7 +110,8 @@ oifname "eth0" masquerade # handle 2
 | `masq_registry_add <iface>` | 幂等追加注册表条目 |
 | `masq_registry_del <iface>` | 移除注册表条目 |
 | `masq_registry_list` | 输出注册表中的接口名（过滤空行/注释/重复） |
-| `sync_masq_registry` | 用 `masq_live_ifaces` 覆盖写入 `$MASQ_REG` |
+| `masq_registry_replace` | 用 stdin 给出的接口集合覆盖写入注册表（去重、去空行/注释）；`masq_registry_add`/`del` 在其上做读-改-写 |
+| `sync_masq_registry` | 用 `masq_live_ifaces` 覆盖写入 `$MASQ_REG`；读取当前规则失败时保留原注册表内容并告警 |
 | `apply_masquerade_from_registry` | `load` 路径：逐接口用 `list_net_ifaces` 校验存在性并补下发，单接口失败不中断 |
 | `pfm_add_iface_from_args <iface>` | 非交互启用指定接口的 masquerade；先用 `list_net_ifaces` 校验接口存在，不存在则 `err` 返回 |
 | `pfm_del_iface_from_args <iface>` | 非交互禁用指定接口：无论规则是否存在，都移除注册表条目；规则存在时按句柄删除 |
@@ -161,6 +162,8 @@ oifname "eth0" masquerade # handle 2
 - 注册表中的接口在当前系统链路中不存在 → `warn "接口 <iface> 不存在，跳过 masquerade 恢复"`，不下发规则、不中断 `load`。
 - 单个接口下发失败 → 记录警告并继续处理其余接口，返回码不影响 `load` 整体成败（与既有 `apply_forward_from_csv` 风格一致）。
 - 注册表文件不存在 → 视为未启用任何 masquerade，静默跳过（首次运行的正常状态）。
+- `ip nat` 表不存在 → 等价于"当前没有任何 masquerade 规则"，按空处理，不报错。
+- 读取当前 masquerade 规则失败（`ip nat` 表存在但读取报错）→ `save` 保留注册表原内容并告警，不把"读取失败"误当作"没有规则"而清空持久化状态。
 
 ## 6. 测试交付物
 
@@ -176,7 +179,7 @@ oifname "eth0" masquerade # handle 2
 
 ### 断言集
 
-**场景隔离**：每个场景开始前执行 `nft flush chain ip nat POSTROUTING` 并清空 `masquerade.csv`，保证场景之间互不影响。
+**场景隔离**：每个场景开始前确保 `ip nat` 表存在，执行 `nft flush chain ip nat POSTROUTING` 并清空 `masquerade.csv`，保证场景之间互不影响、且与执行顺序无关。
 
 | # | 场景 | 断言 |
 |---|---|---|
@@ -186,7 +189,8 @@ oifname "eth0" masquerade # handle 2
 | 4 | 容错 | 手工向注册表写入不存在的 `ens9`，`load` 后断言出现 warn 且未下发该规则 |
 | 5 | 禁用 | `pfm off dummy0` 后断言规则与注册表条目均消失 |
 | 6 | 未启用状态 | 无任何 masquerade 时 `save` 不报错，且注册表为空 |
-| 7 | 默认候选接口路径 | 在 netns 内创建 dummy `eth0`，无参数 `pfm on` 应选中 `eth0` 并写入注册表；`is_masquerade_enabled` 判定为"开启"；另有 `dummy0` 规则时 `status` 的 masquerade 段仍按默认候选接口判定 |
+| 7 | 默认候选接口路径 | 在 netns 内创建 dummy `eth0`，无参数 `pfm on` 应选中 `eth0` 并写入注册表；`is_masquerade_enabled` 判定为"开启"；另有 `dummy0` 规则时 `status` 的 masquerade 段仍按默认候选接口判定；`pfm on nosuchiface` 以非 0 退出且不下发规则 |
+| 8 | 多接口注册表读写 | 同时启用 `dummy0` 与 `eth0` 后注册表含两者；`pfm off dummy0` 后注册表只剩 `eth0`，且 `eth0` 规则仍在、`dummy0` 规则已删；`save` 后注册表不变（验证"读全量→过滤→覆盖写"不丢其他条目） |
 
 ### 退出码
 
@@ -205,6 +209,6 @@ oifname "eth0" masquerade # handle 2
 ## 8. 验收标准
 
 1. `bash -n scripts/nft-mgmt.sh` 与 `shellcheck scripts/nft-mgmt.sh` 无新增告警。
-2. `bash scripts/tests/nft-mgmt-test.sh` 全绿（断言集 1–7）。
+2. `bash scripts/tests/nft-mgmt-test.sh` 全绿（断言集 1–8）。
 3. 真实主机验收：`nft-mgmt pfm on eth0` → `nft-mgmt save` → 重启 → `nft-mgmt status` 显示 masquerade 开启，`nft list chain ip nat POSTROUTING` 含该接口规则。
 4. Docker 共存验收：存在 Docker 的 masquerade 规则时，`save` 后的 `masquerade.csv` 不含 Docker 相关接口，且 `load` 不改动 Docker 规则。

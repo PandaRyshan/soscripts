@@ -200,8 +200,9 @@ is_ipv6() { [[ "$1" =~ ^([0-9a-fA-F:]+)(/[0-9]{1,3})?$ ]] && [[ "$1" == *:* ]]; 
 
 # 端口转发相关配置
 RULES_DIR="/etc/nftables.d"
-RULES_FILE="$RULES_DIR/rules.nft"
 FORWARD_REG="$RULES_DIR/forward.csv"
+# masquerade 持久化注册表：仅记录由本脚本启用的接口
+MASQ_REG="$RULES_DIR/masquerade.csv"
 
 # 清除重复的黑名单规则
 clear_duplicate_blacklist_rules() {
@@ -470,7 +471,7 @@ add_forward_rule() {
 
     # 更新注册表：合并为 any（若已有另一协议）
     mkdir_p_rules_dir
-    touch "$FORWARD_REG"
+    $SUDO_CMD touch "$FORWARD_REG"
     local tmp; tmp=$(mktemp)
     $SUDO_CMD awk -F',' -v p="$pub" -v pr="$proto" -v ip="$dip" -v dp="$dp" -v r="$remark" 'BEGIN{OFS=","}
         { keep=1; if ($1==p && $3==ip && $4==dp) { keep=0; } if(keep) print $0 }
@@ -529,14 +530,6 @@ delete_forward_rules() {
     done
 }
 
-save_forward_rules() {
-    require_root_or_sudo
-    mkdir_p_rules_dir
-    # 过滤 iptables-nft 打印的 Warning 行，避免加载时解析失败
-    $SUDO_CMD sh -c "nft list ruleset | sed '/^Warning:/d' > '$RULES_FILE'"
-    log "已保存规则到 $RULES_FILE"
-}
-
 clear_forward_rules() {
     require_root_or_sudo
     ensure_nat_table
@@ -560,7 +553,7 @@ clear_forward_rules() {
             fi
         done < "$FORWARD_REG"
     fi
-    : > "$FORWARD_REG"
+    $SUDO_CMD sh -c ": > '$FORWARD_REG'"
     log "已清空端口转发规则（PREROUTING 链已刷新，CSV 已清空）"
 }
 
@@ -597,7 +590,7 @@ pf_add_from_args() {
 
     # 更新注册表：写入记录并聚合 any
     mkdir_p_rules_dir
-    touch "$FORWARD_REG"
+    $SUDO_CMD touch "$FORWARD_REG"
     local tmp; tmp=$(mktemp)
     $SUDO_CMD awk -F',' -v p="$pub" -v pr="$proto" -v ip="$dip" -v dp="$dp" -v r="$remark" 'BEGIN{OFS=","}
         { keep=1; if ($1==p && $3==ip && $4==dp) { keep=0; } if(keep) print $0 }
@@ -681,12 +674,112 @@ ensure_forward_baseline() {
     $SUDO_CMD nft add rule ip filter FORWARD ct state \\{ established, related \\} accept >/dev/null 2>&1 || true
 }
 
+# ---------- masquerade：解析 / 注册表 / 状态查询 ----------
+# 解析 POSTROUTING 链，每行输出 "接口名,规则句柄"。纯读取，不创建表或链。
+# 默认只输出本脚本启用的规则（形如 oifname "eth0" masquerade），排除
+# ip saddr/ip6 saddr/fib 限定——那些是 Docker 等外部工具生成的规则。
+# --all 供展示使用：放宽上述限定，但仍排除 oifname != "X"（排除项而非启用项）。
+masq_parse_live() {
+    require_root_or_sudo
+    local all=""
+    [[ "${1:-}" == "--all" ]] && all=1
+    local out=""
+    # ip nat 表不存在等价于"当前没有任何 masquerade 规则"；表存在却读取失败则向上
+    # 报告，避免调用方把"读取失败"误当成"没有规则"而清空注册表。
+    if $SUDO_CMD nft list tables 2>/dev/null | grep -qx "table ip nat"; then
+        out=$($SUDO_CMD nft -a list chain ip nat POSTROUTING 2>/dev/null) || { err "读取 ip nat POSTROUTING 失败"; return 1; }
+    fi
+    printf '%s\n' "$out" | awk -v all="$all" '
+        /masquerade/ {
+            if ($0 ~ /!=/) next
+            if (all != 1 && $0 ~ /(ip saddr|ip6 saddr|fib)/) next
+            handle = ""
+            for (i = 1; i <= NF; i++) if ($i == "handle") handle = $(i + 1)
+            if (all == 1 && handle == "") next
+            found = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i != "oifname") continue
+                j = i + 1
+                if (j <= NF && $(j) == "{") {
+                    for (j = j + 1; j <= NF && $(j) != "}"; j++) {
+                        n = $(j); gsub(/[",]/, "", n)
+                        if (n != "") { print n "," handle; found = 1 }
+                    }
+                } else if (j <= NF && $(j) ~ /^"/) {
+                    n = $(j); gsub(/[",]/, "", n)
+                    if (n != "") { print n "," handle; found = 1 }
+                }
+            }
+            # 展示/删除场景下，没有 oifname 的 masquerade 规则也要能被列出（接口名留空）
+            if (!found && all == 1) print "," handle
+        }'
+}
+
+masq_iface_has_rule() {
+    local iface="${1:-}"
+    [[ -z "$iface" ]] && return 1
+    masq_parse_live | awk -F',' -v w="$iface" '$1 == w { found = 1 } END { exit !found }'
+}
+
+masq_live_ifaces() {
+    masq_parse_live | awk -F',' '$1 != "" { print $1 }' | sort -u
+}
+
+masq_registry_list() {
+    [[ -f "$MASQ_REG" ]] || return 0
+    local out
+    out=$($SUDO_CMD cat "$MASQ_REG" 2>/dev/null) || { err "读取 masquerade 注册表失败: $MASQ_REG"; return 1; }
+    printf '%s\n' "$out" | awk 'NF && $0 !~ /^[[:space:]]*#/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+        if ($0 != "" && !seen[$0]++) print $0
+    }'
+}
+
+# 用 stdin 给出的接口名集合覆盖写入注册表（去重、去空行/注释）
+masq_registry_replace() {
+    require_root_or_sudo
+    mkdir_p_rules_dir
+    local tmp; tmp=$(mktemp)
+    awk 'NF && $0 !~ /^[[:space:]]*#/ {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+        if ($0 != "" && !seen[$0]++) print $0
+    }' > "$tmp"
+    $SUDO_CMD mv "$tmp" "$MASQ_REG"
+}
+
+masq_registry_add() {
+    local iface="${1:-}"
+    [[ -z "$iface" ]] && return 1
+    local current
+    current=$(masq_registry_list) || return 1
+    printf '%s\n%s\n' "$current" "$iface" | masq_registry_replace
+}
+
+masq_registry_del() {
+    local iface="${1:-}"
+    [[ -z "$iface" ]] && return 1
+    local current
+    current=$(masq_registry_list) || return 1
+    printf '%s\n' "$current" | awk -v w="$iface" '$0 != w' | masq_registry_replace
+}
+
+# 以当前内核状态覆盖注册表，纠正手工 nft 操作造成的漂移。
+# 读取失败时保留原内容，避免把"读不到"误当作"没有规则"而丢失持久化状态。
+sync_masq_registry() {
+    require_root_or_sudo
+    local live
+    if ! live=$(masq_live_ifaces); then
+        warn "读取当前 masquerade 规则失败，保留注册表原内容"
+        return 1
+    fi
+    printf '%s\n' "$live" | masq_registry_replace
+}
+
 list_masquerade() {
     require_root_or_sudo
     ensure_nat_table
-    local out ifaces
-    out=$($SUDO_CMD nft -a list chain ip nat POSTROUTING 2>/dev/null || true)
-    ifaces=$(echo "$out" | awk '{if($0 ~ /masquerade/){iface=""; handle=""; for(i=1;i<=NF;i++){if($i=="oifname"){iface=$(i+1)} else if($i=="handle"){handle=$(i+1)}}; gsub(/"/,"",iface); if(iface!="") printf("%s\n", iface)}}' | sort -u)
+    local ifaces
+    ifaces=$(masq_parse_live --all | awk -F',' '$1 != "" { print $1 }' | sort -u | tr '\n' ' ' | sed 's/ *$//')
     echo
     if [[ -z "$ifaces" ]]; then echo "masquerade: 未开启（默认接口 eth0/enp3s0/ens33）"; else echo "masquerade: 已开启于接口 -> $ifaces"; fi
     echo
@@ -696,25 +789,20 @@ auto_enable_masquerade_default_eth0() {
     require_root_or_sudo
     ensure_nat_table
     local iface
-    iface=$(pick_available_default_iface)
+    iface=$(pick_available_default_iface || true)
     if [[ -z "$iface" ]]; then
         warn "未找到默认候选接口 eth0/enp3s0/ens33；跳过自动开启"
         return 0
     fi
-    # 若该候选接口尚未启用 masquerade，则自动添加
-    local has_iface
-    has_iface=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk -v want="$iface" 'BEGIN{f=0}
-        /masquerade/ {
-            for(i=1;i<=NF;i++){
-                if($i=="oifname" && $(i+1)!="!="){
-                    iface=$(i+1); gsub(/"/,"",iface);
-                    if(iface==want){ f=1; break }
-                }
-            }
-        }
-        END{print f}')
-    if [[ "${has_iface:-0}" -ge 1 ]]; then return 0; fi
-    $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade >/dev/null 2>&1 || true
+    if masq_iface_has_rule "$iface"; then
+        masq_registry_add "$iface" || true
+        return 0
+    fi
+    if ! $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade >/dev/null 2>&1; then
+        warn "自动在接口 $iface 启用 masquerade 失败"
+        return 0
+    fi
+    masq_registry_add "$iface" || true
     log "检测到默认接口未启用 masquerade；已自动在 $iface 启用"
 }
 
@@ -731,24 +819,25 @@ enable_masquerade() {
     local iface
     read -rp "选择接口（默认 eth0/enp3s0/ens33，输入0返回）：" iface || true
     if [[ -z "${iface:-}" ]]; then
-        iface=$(pick_available_default_iface)
+        iface=$(pick_available_default_iface || true)
         [[ -z "$iface" ]] && iface="eth0"
     fi
     [[ "$iface" == "0" ]] && return 0
-    $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade || true
-    log "已在接口 $iface 启用 masquerade"
+    pfm_add_iface_from_args "$iface"
 }
 
 disable_masquerade() {
     require_root_or_sudo
     ensure_nat_table
-    local out lines
-    out=$($SUDO_CMD nft -a list chain ip nat POSTROUTING 2>/dev/null || true)
-    mapfile -t lines < <(echo "$out" | awk '{if($0 ~ /masquerade/){iface=""; handle=""; for(i=1;i<=NF;i++){if($i=="oifname"){iface=$(i+1)} else if($i=="handle"){handle=$(i+1)}}; gsub(/"/,"",iface); if(handle!="") printf("%s,%s\n", iface, handle)}}')
+    local lines=() line iface handle idx sel i
+    mapfile -t lines < <(masq_parse_live --all | awk -F',' 'NF >= 2 && $2 != ""')
     if [[ ${#lines[@]} -eq 0 ]]; then echo "当前未检测到 masquerade 规则"; return 0; fi
-    local i=0
-    for line in "${lines[@]}"; do i=$((i+1)); IFS=',' read -r iface handle <<< "$line"; printf "%d) %s (handle %s)\n" "$i" "$iface" "$handle"; done
-    local sel
+    i=0
+    for line in "${lines[@]}"; do
+        i=$((i + 1))
+        IFS=',' read -r iface handle <<< "$line"
+        printf "%d) %s (handle %s)\n" "$i" "$iface" "$handle"
+    done
     read -rp "输入要关闭的编号（可空格/逗号分隔，0 返回）：" sel || true
     [[ -z "${sel:-}" || "$sel" == "0" ]] && return 0
     sel=${sel//,/ }
@@ -756,9 +845,80 @@ disable_masquerade() {
         if ! [[ "$idx" =~ ^[0-9]+$ ]]; then echo "跳过无效编号: $idx"; continue; fi
         if (( idx < 1 || idx > ${#lines[@]} )); then echo "编号超出范围: $idx"; continue; fi
         IFS=',' read -r iface handle <<< "${lines[$((idx-1))]}"
-        $SUDO_CMD nft delete rule ip nat POSTROUTING handle "$handle" || true
+        $SUDO_CMD nft delete rule ip nat POSTROUTING handle "$handle" >/dev/null 2>&1 || true
+        # 仅当该接口已无本脚本的 masquerade 规则时，才清除持久化记录
+        # （列表里可能混有同接口的外部规则，删它不应影响本脚本的持久化意图）
+        if ! masq_iface_has_rule "$iface"; then
+            masq_registry_del "$iface" || true
+        fi
         log "已关闭接口 $iface 的 masquerade"
     done
+}
+
+# 非交互：启用指定接口的 masquerade
+pfm_add_iface_from_args() {
+    require_root_or_sudo
+    ensure_nat_table
+    local iface="${1:-}"
+    if [[ -z "$iface" ]]; then err "缺少接口名：pfm on <iface>"; return 1; fi
+    if ! list_net_ifaces | grep -qx "$iface"; then
+        err "接口不存在: $iface"; return 1
+    fi
+    if masq_iface_has_rule "$iface"; then
+        masq_registry_add "$iface" || warn "masquerade 注册表写入失败，重启后不会自动恢复: $iface"
+        log "接口 $iface 的 masquerade 已处于启用状态"
+        return 0
+    fi
+    if ! $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade; then
+        err "启用 masquerade 失败: $iface"; return 1
+    fi
+    masq_registry_add "$iface" || warn "masquerade 注册表写入失败，重启后不会自动恢复: $iface"
+    log "已在接口 $iface 启用 masquerade"
+}
+
+# 非交互：关闭指定接口的 masquerade
+pfm_del_iface_from_args() {
+    require_root_or_sudo
+    ensure_nat_table
+    local iface="${1:-}"
+    if [[ -z "$iface" ]]; then err "缺少接口名：pfm off <iface>"; return 1; fi
+    local removed=0 r_iface handle
+    while IFS=',' read -r r_iface handle; do
+        [[ "$r_iface" == "$iface" ]] || continue
+        [[ -z "$handle" ]] && continue
+        if $SUDO_CMD nft delete rule ip nat POSTROUTING handle "$handle" >/dev/null 2>&1; then removed=1; fi
+    done < <(masq_parse_live)
+    # 仅当该接口已无本脚本的 masquerade 规则时，才清除持久化记录
+    if ! masq_iface_has_rule "$iface"; then
+        masq_registry_del "$iface" || true
+    fi
+    if [[ "$removed" -eq 1 ]]; then
+        log "已关闭接口 $iface 的 masquerade"
+    else
+        log "接口 $iface 无 masquerade 规则，已清除其持久化记录"
+    fi
+}
+
+# load 路径：按注册表恢复 masquerade；接口在当前系统不存在则跳过
+apply_masquerade_from_registry() {
+    require_root_or_sudo
+    ensure_nat_table
+    mkdir_p_rules_dir
+    local ifaces iface
+    ifaces=$(list_net_ifaces)
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        if ! echo "$ifaces" | grep -qx "$iface"; then
+            warn "接口 $iface 不存在，跳过 masquerade 恢复"
+            continue
+        fi
+        if masq_iface_has_rule "$iface"; then continue; fi
+        if $SUDO_CMD nft add rule ip nat POSTROUTING oifname "$iface" masquerade >/dev/null 2>&1; then
+            log "已恢复接口 $iface 的 masquerade"
+        else
+            warn "恢复接口 $iface 的 masquerade 失败"
+        fi
+    done < <(masq_registry_list || true)
 }
 
 print_forward_status() {
@@ -805,23 +965,15 @@ pick_available_default_iface() {
     echo ""; return 1
 }
 
-# 判断 masquerade 是否开启（任意接口）
+# 判断 masquerade 是否开启（默认候选接口 eth0/enp3s0/ens33 任一已启用）
 is_masquerade_enabled() {
     require_root_or_sudo
     ensure_nat_table
-    # 存在 eth0/enp3s0/ens33 任一接口的 masquerade 则视为开启
-    local has_any
-    has_any=$($SUDO_CMD nft list chain ip nat POSTROUTING 2>/dev/null | awk 'BEGIN{f=0}
-        /masquerade/ {
-            for(i=1;i<=NF;i++){
-                if($i=="oifname" && $(i+1)!="!="){
-                    iface=$(i+1); gsub(/"/,"",iface);
-                    if(iface=="eth0" || iface=="enp3s0" || iface=="ens33"){ f=1; break }
-                }
-            }
-        }
-        END{print f}')
-    [[ "${has_any:-0}" -ge 1 ]]
+    local candidates
+    candidates=$(default_nat_iface_candidates)
+    masq_parse_live | awk -F',' -v list="$candidates" '
+        BEGIN { n = split(list, c, " "); for (i = 1; i <= n; i++) want[c[i]] = 1 }
+        want[$1] { found = 1 } END { exit !found }'
 }
 
 # 简化版状态（默认）
@@ -938,6 +1090,16 @@ save_rules() {
     # 仅保存我们管理的 inet filter 表，避免将 iptables-nft 兼容层的 xt 规则写入文件导致加载失败
     $SUDO_CMD sh -c "nft list table inet filter > '$CONF_FILE'"
     log "已保存 inet filter 规则到 $CONF_FILE"
+    # masquerade 位于 ip nat 表，不在上述文件内；以当前内核状态刷新注册表
+    sync_masq_registry || true
+    local masq_ifaces
+    if ! masq_ifaces=$(masq_registry_list); then
+        warn "masquerade 注册表读取失败，无法确认已记录接口"
+    elif [[ -z "$masq_ifaces" ]]; then
+        log "masquerade: 未启用（未记录任何接口）"
+    else
+        log "masquerade 已记录接口: $(printf '%s' "$masq_ifaces" | tr '\n' ' ' | sed 's/ *$//')"
+    fi
 }
 
 load_rules() {
@@ -962,6 +1124,8 @@ load_rules() {
     # 根据 CSV 重新应用端口转发（PREROUTING dnat），并同步 FORWARD 过滤接受规则
     apply_forward_from_csv || true
     sync_forward_filter_accept || true
+    # 按注册表恢复 masquerade（接口在当前系统不存在则跳过）
+    apply_masquerade_from_registry || true
     # 确保白名单控制逻辑与集合状态同步
     sync_wl_ctrl || true
     if [[ "$loaded" -eq 1 ]]; then
@@ -1067,8 +1231,8 @@ usage() {
     pf del <proto> <pub> <dip/host> <dp>
                                通过参数删除端口转发（精准删除，无需备注）
     pf clear                   清空所有端口转发规则
-    pfm on                     启用默认接口的 masquerade（eth0/enp3s0/ens33）
-    pfm off                    关闭当前开启的默认接口 masquerade（需交互选择）
+    pfm on [iface]             启用 masquerade；不带参数启用默认接口（eth0/enp3s0/ens33）
+    pfm off [iface]            关闭 masquerade；不带参数按编号交互选择
 
 说明:
     - 白名单集合为空时，不限制黑名单以外的 IP 访问；非空时，仅允许白名单访问。
@@ -1195,8 +1359,22 @@ main() {
             ;;
         pfm)
             case "${1:-}" in
-                on) auto_enable_masquerade_default_eth0 ;;
-                off) disable_masquerade ;;
+                on)
+                    shift || true
+                    if [[ -z "${1:-}" ]]; then
+                        auto_enable_masquerade_default_eth0
+                    else
+                        pfm_add_iface_from_args "${1:-}"
+                    fi
+                    ;;
+                off)
+                    shift || true
+                    if [[ -z "${1:-}" ]]; then
+                        disable_masquerade
+                    else
+                        pfm_del_iface_from_args "${1:-}"
+                    fi
+                    ;;
                 "") masquerade_menu ;;
                 *) err "未知 pfm 子命令"; usage; exit 1 ;;
             esac
